@@ -4095,4 +4095,557 @@ mod testsuit {
         assert!(bill.paid_at.is_some());
         assert_eq!(bill.amount, 500);
     }
+
+    // =========================================================================
+    // restore_from_snapshot — deterministic failure-boundary coverage
+    //
+    // Covers all error paths, permission guards, stale-state rejection,
+    // schema-version mismatch, idempotency, and full state-reconstruction
+    // fidelity.  Each test names the invariant it asserts so reviewers can
+    // map code → requirement without reading both files.
+    // =========================================================================
+
+    /// INVARIANT: restore_from_snapshot returns SnapshotNotFound when no
+    /// snapshot has been written (no prior pre_upgrade call).
+    #[test]
+    fn test_restore_no_snapshot_returns_snapshot_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        let result = client.try_restore_from_snapshot(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(Error::SnapshotNotFound)),
+            "restore must fail with SnapshotNotFound when no snapshot exists"
+        );
+    }
+
+    /// INVARIANT: restore_from_snapshot returns Unauthorized when called by
+    /// an address that is not the current upgrade admin.
+    #[test]
+    fn test_restore_by_non_admin_returns_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let interloper = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+        // Take a valid snapshot so we are sure the auth check fires before the
+        // snapshot-not-found check.
+        client.pre_upgrade(&admin);
+
+        let result = client.try_restore_from_snapshot(&interloper);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "restore must reject callers that are not the upgrade admin"
+        );
+    }
+
+    /// INVARIANT: restore_from_snapshot returns Unauthorized when no upgrade
+    /// admin has been set at all (contract freshly deployed).
+    #[test]
+    fn test_restore_with_no_upgrade_admin_returns_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        // No set_upgrade_admin call — admin slot is empty.
+        let stranger = Address::generate(&env);
+
+        let result = client.try_restore_from_snapshot(&stranger);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "restore must fail with Unauthorized when upgrade admin is not configured"
+        );
+    }
+
+    /// INVARIANT: restore_from_snapshot returns SnapshotTooOld when the
+    /// snapshot timestamp is older than SNAPSHOT_MAX_AGE_SECS (30 days).
+    ///
+    /// The ledger is advanced to just beyond the staleness threshold so the
+    /// age check fires deterministically without flakiness.
+    #[test]
+    fn test_restore_stale_snapshot_returns_snapshot_too_old() {
+        use remitwise_common::SNAPSHOT_MAX_AGE_SECS;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        // Start at a non-zero timestamp so subtraction stays valid.
+        let start_ts: u64 = 1_000_000;
+        set_time(&env, start_ts);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        // Take snapshot at start_ts.
+        client.pre_upgrade(&admin);
+
+        // Advance the ledger beyond the 30-day freshness window.
+        // +1 ensures we are strictly past the boundary.
+        let stale_ts = start_ts + SNAPSHOT_MAX_AGE_SECS + 1;
+        set_time(&env, stale_ts);
+
+        let result = client.try_restore_from_snapshot(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(Error::SnapshotTooOld)),
+            "restore must reject a snapshot older than SNAPSHOT_MAX_AGE_SECS"
+        );
+    }
+
+    /// INVARIANT: restore_from_snapshot returns InvalidLimit (the current
+    /// error code for schema-version mismatch — see SNAPSHOT_VERSION comment
+    /// in lib.rs) when the stored snapshot carries a schema_version that does
+    /// not match SNAPSHOT_VERSION.
+    ///
+    /// The mismatch is injected directly into persistent storage using
+    /// env.as_contract so no production code path is used to write the
+    /// bogus snapshot.
+    #[test]
+    fn test_restore_schema_version_mismatch_returns_invalid_limit() {
+        use remitwise_common::SNAPSHOT_KEY;
+        use soroban_sdk::symbol_short;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let start_ts: u64 = 1_000_000;
+        set_time(&env, start_ts);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        // Inject a snapshot with a schema_version that will never match
+        // SNAPSHOT_VERSION (which is 1).
+        let bad_snapshot = PreUpgradeSnapshot {
+            schema_version: 0xDEAD_BEEF, // intentionally wrong
+            next_id: 42,
+            version: 1,
+            upgrade_admin: Some(admin.clone()),
+            paused: false,
+            pause_admin: None,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&SNAPSHOT_KEY, &bad_snapshot);
+            // Also write a fresh SNAP_TS so the freshness check is not the
+            // first thing to fail.
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("SNAP_TS"), &start_ts);
+        });
+
+        let result = client.try_restore_from_snapshot(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidLimit)),
+            "restore must return InvalidLimit for a schema_version != SNAPSHOT_VERSION"
+        );
+    }
+
+    /// INVARIANT: a successful pre_upgrade → restore_from_snapshot round-trip
+    /// reconstructs all instance-storage fields exactly: next_id, version,
+    /// upgrade_admin, paused (false), and pause_admin.
+    #[test]
+    fn test_restore_roundtrip_reconstructs_all_state_fields() {
+        use soroban_sdk::symbol_short;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let start_ts: u64 = 1_000_000;
+        set_time(&env, start_ts);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pause_admin = Address::generate(&env);
+
+        // --- Set up initial state ---
+        client.set_upgrade_admin(&admin, &admin);
+
+        // Set a custom version (so it differs from CONTRACT_VERSION default).
+        client.set_version(&admin, &42u32);
+
+        // Set a pause admin so Option<Address> is Some.
+        client.set_pause_admin(&admin, &pause_admin);
+
+        // Create a bill to advance next_id beyond 0.
+        let _bill_id = client.create_bill(
+            &admin,
+            &String::from_str(&env, "Rent"),
+            &1000,
+            &2_000_000u64,
+            &false,
+            &0u32,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+
+        // Record the state we expect to come back after restore.
+        // next_id is a private field; read it via env.as_contract.
+        let expected_next_id: u32 = env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("NEXT_ID"))
+                .unwrap_or(0u32)
+        });
+        let expected_version = client.get_version();
+        let expected_upgrade_admin = client.get_upgrade_admin_public();
+        let expected_pause_admin = client.get_pause_admin_public();
+
+        // --- Overwrite version to simulate a (failed) upgrade ---
+        client.set_version(&admin, &999u32);
+        assert_eq!(client.get_version(), 999u32, "precondition: version was overwritten");
+
+        // --- Snapshot & restore ---
+        client.pre_upgrade(&admin);
+        client.restore_from_snapshot(&admin);
+
+        // --- Verify every field was restored exactly ---
+        let restored_next_id: u32 = env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("NEXT_ID"))
+                .unwrap_or(0u32)
+        });
+        assert_eq!(
+            restored_next_id, expected_next_id,
+            "next_id must be restored exactly"
+        );
+        assert_eq!(
+            client.get_version(),
+            expected_version,
+            "version must be restored exactly"
+        );
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            expected_upgrade_admin,
+            "upgrade_admin must be restored exactly"
+        );
+        assert_eq!(
+            client.get_pause_admin_public(),
+            expected_pause_admin,
+            "pause_admin must be restored exactly"
+        );
+        // paused was false at snapshot time — must remain false after restore
+        assert!(
+            !client.is_paused(),
+            "paused must be false after restoring a snapshot taken while unpaused"
+        );
+    }
+
+    /// INVARIANT: restore_from_snapshot is idempotent in the failure direction:
+    /// a second call after a successful first call must return SnapshotNotFound
+    /// because the first call consumed (removed) the snapshot.
+    #[test]
+    fn test_restore_consumes_snapshot_second_restore_returns_snapshot_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000_000);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        client.pre_upgrade(&admin);
+
+        // First restore — must succeed.
+        client.restore_from_snapshot(&admin);
+
+        // Second restore — snapshot has been consumed.
+        let result = client.try_restore_from_snapshot(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(Error::SnapshotNotFound)),
+            "second restore must fail with SnapshotNotFound (snapshot was consumed by first call)"
+        );
+    }
+
+    /// INVARIANT: pre_upgrade + restore_from_snapshot preserves a `paused = true`
+    /// state exactly — the contract must come back paused after a restore of a
+    /// snapshot taken while paused.
+    #[test]
+    fn test_restore_roundtrip_preserves_paused_true() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000_000);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pause_admin = Address::generate(&env);
+
+        client.set_upgrade_admin(&admin, &admin);
+        client.set_pause_admin(&admin, &pause_admin);
+
+        // Pause the contract before taking the snapshot.
+        client.pause(&pause_admin);
+        assert!(client.is_paused(), "precondition: contract must be paused");
+
+        client.pre_upgrade(&admin);
+
+        // Unpause to simulate a (partial) upgrade that reversed pause state.
+        client.unpause(&pause_admin);
+        assert!(!client.is_paused(), "precondition: contract must be unpaused after unpause");
+
+        // Restore should re-apply the paused=true state from the snapshot.
+        client.restore_from_snapshot(&admin);
+
+        assert!(
+            client.is_paused(),
+            "paused must be true after restoring a snapshot taken while paused"
+        );
+    }
+
+    /// INVARIANT: pre_upgrade + restore_from_snapshot preserves pause_admin = None
+    /// (an Option field that was never set must come back as None, not as a stale
+    /// previous value).
+    #[test]
+    fn test_restore_roundtrip_preserves_pause_admin_none() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000_000);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+        // Explicitly do NOT call set_pause_admin — pause_admin should be None.
+
+        client.pre_upgrade(&admin);
+        client.restore_from_snapshot(&admin);
+
+        assert!(
+            client.get_pause_admin_public().is_none(),
+            "pause_admin must be None after restoring a snapshot where pause_admin was not set"
+        );
+    }
+
+    /// INVARIANT: discard_snapshot removes the snapshot so that a subsequent
+    /// restore_from_snapshot returns SnapshotNotFound.
+    #[test]
+    fn test_discard_snapshot_makes_subsequent_restore_fail_with_snapshot_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000_000);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        client.pre_upgrade(&admin);
+        client.discard_snapshot(&admin);
+
+        let result = client.try_restore_from_snapshot(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(Error::SnapshotNotFound)),
+            "restore must fail with SnapshotNotFound after discard_snapshot"
+        );
+    }
+
+    /// INVARIANT: pre_upgrade returns Unauthorized when called by an address
+    /// that is not the upgrade admin.
+    #[test]
+    fn test_pre_upgrade_by_non_admin_returns_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let interloper = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        let result = client.try_pre_upgrade(&interloper);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "pre_upgrade must reject callers that are not the upgrade admin"
+        );
+    }
+
+    /// INVARIANT: discard_snapshot returns Unauthorized when called by an
+    /// address that is not the upgrade admin.
+    #[test]
+    fn test_discard_snapshot_by_non_admin_returns_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000_000);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let interloper = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        client.pre_upgrade(&admin);
+
+        let result = client.try_discard_snapshot(&interloper);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "discard_snapshot must reject callers that are not the upgrade admin"
+        );
+    }
+
+    /// INVARIANT: the kill switch blocks restore_from_snapshot.
+    ///
+    /// When the kill switch is active all write entry points must be blocked.
+    /// restore_from_snapshot is a write operation (it mutates instance storage)
+    /// and must therefore be blocked.
+    ///
+    /// The kill switch is injected via env.as_contract so we are testing the
+    /// guard that was added to the entry point, not a higher-level auth layer.
+    #[test]
+    fn test_kill_switch_blocks_restore_from_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000_000);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+        client.pre_upgrade(&admin);
+
+        // Activate kill switch directly in contract storage.
+        env.as_contract(&contract_id, || {
+            remitwise_common::activate_kill_switch(&env);
+        });
+
+        let result = client.try_restore_from_snapshot(&admin);
+        assert!(
+            result.is_err(),
+            "restore_from_snapshot must be blocked when the kill switch is active"
+        );
+    }
+
+    /// INVARIANT: the kill switch blocks pre_upgrade.
+    #[test]
+    fn test_kill_switch_blocks_pre_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        env.as_contract(&contract_id, || {
+            remitwise_common::activate_kill_switch(&env);
+        });
+
+        let result = client.try_pre_upgrade(&admin);
+        assert!(
+            result.is_err(),
+            "pre_upgrade must be blocked when the kill switch is active"
+        );
+    }
+
+    /// INVARIANT: the kill switch blocks discard_snapshot.
+    #[test]
+    fn test_kill_switch_blocks_discard_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000_000);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+        client.pre_upgrade(&admin);
+
+        env.as_contract(&contract_id, || {
+            remitwise_common::activate_kill_switch(&env);
+        });
+
+        let result = client.try_discard_snapshot(&admin);
+        assert!(
+            result.is_err(),
+            "discard_snapshot must be blocked when the kill switch is active"
+        );
+    }
+
+    /// BOUNDARY: restore at exactly SNAPSHOT_MAX_AGE_SECS must succeed (the
+    /// boundary is inclusive on the inside — age == MAX is still fresh).
+    #[test]
+    fn test_restore_at_exact_boundary_age_succeeds() {
+        use remitwise_common::SNAPSHOT_MAX_AGE_SECS;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let start_ts: u64 = 1_000_000;
+        set_time(&env, start_ts);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        client.pre_upgrade(&admin);
+
+        // Advance to exactly the boundary: age == SNAPSHOT_MAX_AGE_SECS.
+        let boundary_ts = start_ts + SNAPSHOT_MAX_AGE_SECS;
+        set_time(&env, boundary_ts);
+
+        // Must succeed — boundary is inclusive.
+        client.restore_from_snapshot(&admin);
+    }
+
+    /// BOUNDARY: restore at SNAPSHOT_MAX_AGE_SECS + 1 must fail (the boundary
+    /// is exclusive on the outside — age > MAX is stale).
+    #[test]
+    fn test_restore_one_second_past_boundary_returns_snapshot_too_old() {
+        use remitwise_common::SNAPSHOT_MAX_AGE_SECS;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let start_ts: u64 = 1_000_000;
+        set_time(&env, start_ts);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        client.pre_upgrade(&admin);
+
+        // age == SNAPSHOT_MAX_AGE_SECS + 1 → must be rejected.
+        let stale_ts = start_ts + SNAPSHOT_MAX_AGE_SECS + 1;
+        set_time(&env, stale_ts);
+
+        let result = client.try_restore_from_snapshot(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(Error::SnapshotTooOld)),
+            "age one second past the boundary must be rejected as SnapshotTooOld"
+        );
+    }
+
+    /// REGRESSION: discard_snapshot on a contract with no snapshot present
+    /// must not panic — it is a no-op on persistent storage and must return Ok.
+    #[test]
+    fn test_discard_snapshot_without_prior_snapshot_is_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.set_upgrade_admin(&admin, &admin);
+
+        // No pre_upgrade — discard on empty storage must succeed silently.
+        client.discard_snapshot(&admin);
+    }
 }
