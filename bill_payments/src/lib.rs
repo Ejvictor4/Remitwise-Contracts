@@ -79,6 +79,7 @@ const STORAGE_OWNER_INDEX: Symbol = symbol_short!("OWN_IDX");
 const STORAGE_ARCH_INDEX: Symbol = symbol_short!("ARCH_IDX");
 const STORAGE_CURRENCY_INDEX: Symbol = symbol_short!("CUR_IDX");
 const ARCH_IDX_KEY: Symbol = STORAGE_ARCH_INDEX;
+const STORAGE_PAUSED_SINCE: Symbol = symbol_short!("PAUSED_AT");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -700,9 +701,15 @@ impl BillPayments {
         if admin != caller {
             return Err(BillPaymentsError::UnauthorizedPause);
         }
+        let was_paused = Self::get_global_paused(&env);
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSED"), &true);
+        if !was_paused {
+            env.storage()
+                .instance()
+                .set(&STORAGE_PAUSED_SINCE, &env.ledger().timestamp());
+        }
         // Cancel any pending unpause schedule to prevent timelock bypass
         env.storage().instance().remove(&symbol_short!("UNP_AT"));
         RemitwiseEvents::emit(
@@ -734,6 +741,7 @@ impl BillPayments {
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSED"), &false);
+        env.storage().instance().remove(&STORAGE_PAUSED_SINCE);
         RemitwiseEvents::emit(
             &env,
             EventCategory::System,
@@ -823,6 +831,13 @@ impl BillPayments {
 
     pub fn is_paused(env: Env) -> bool {
         Self::get_global_paused(&env)
+    }
+    /// Returns the recorded start of the current global pause.
+    ///
+    /// Repeated pause calls preserve the original timestamp; a successful unpause
+    /// clears it. A legacy paused state without a recorded timestamp returns `None`.
+    pub fn get_paused_since(env: Env) -> Option<u64> {
+        env.storage().instance().get(&STORAGE_PAUSED_SINCE)
     }
     pub fn is_function_paused_public(env: Env, func: Symbol) -> bool {
         Self::is_function_paused(&env, func)
