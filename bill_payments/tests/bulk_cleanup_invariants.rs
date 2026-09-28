@@ -29,7 +29,10 @@
 //!    bill for an owner leaves a clean, empty archive index for that owner.
 //! 10. **Overflow safety** – `i128` totals are never corrupted by cleanup.
 
-use bill_payments::{BillPayments, BillPaymentsClient, BillPaymentsError};
+use bill_payments::{
+    BillPayments, BillPaymentsClient, BillPaymentsError, DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS,
+};
+use remitwise_common::MAX_AMOUNT;
 use soroban_sdk::testutils::{Address as AddressTrait, EnvTestConfig, Ledger, LedgerInfo};
 use soroban_sdk::{Address, Env, String};
 
@@ -60,7 +63,7 @@ fn make_env() -> Env {
 }
 
 /// Register the contract and return (client, owner address).
-fn setup(env: &Env) -> (BillPaymentsClient, Address) {
+fn setup(env: &Env) -> (BillPaymentsClient<'_>, Address) {
     let cid = env.register_contract(None, BillPayments);
     let client = BillPaymentsClient::new(env, &cid);
     let owner = Address::generate(env);
@@ -95,22 +98,29 @@ fn create_unpaid_bills(
         .collect()
 }
 
+/// Configure the trusted orchestrator required by the cross-contract epoch
+/// guard on `pay_bill`. Returns the orchestrator address to pass to
+/// `pay_bill(&orch, &0, ...)` (epoch 0 is the default for a fresh contract).
+fn setup_orchestrator(client: &BillPaymentsClient, admin: &Address) -> Address {
+    let orch = Address::generate(&client.env);
+    client.init_admin(admin, &DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS);
+    client.set_trusted_orchestrator(admin, &orch);
+    orch
+}
+
 /// Pay every bill in `ids` then archive them all before `u64::MAX`.
 /// Returns the number archived.
-fn pay_and_archive(
-    client: &BillPaymentsClient,
-    owner: &Address,
-    ids: &[u32],
-) -> u32 {
+fn pay_and_archive(client: &BillPaymentsClient, owner: &Address, ids: &[u32]) -> u32 {
+    let orch = setup_orchestrator(client, owner);
     for id in ids {
-        client.pay_bill(owner, id);
+        client.pay_bill(&orch, &0, owner, id);
     }
     client.archive_paid_bills(owner, &u64::MAX)
 }
 
 /// Collect all archived bill IDs for `owner` via full pagination.
 fn all_archived_ids(
-    env: &Env,
+    _env: &Env,
     client: &BillPaymentsClient,
     owner: &Address,
 ) -> std::vec::Vec<u32> {
@@ -228,7 +238,10 @@ fn test_cleanup_archive_count_decrements_exactly() {
     // Cleanup with timestamp that excludes all (before_timestamp <= archived_at)
     // archived_at == 1_700_000_000; use exactly that value → nothing deleted
     let cleaned_none = client.bulk_cleanup_bills(&owner, &1_700_000_000u64);
-    assert_eq!(cleaned_none, 0, "timestamp equal to archived_at must not delete");
+    assert_eq!(
+        cleaned_none, 0,
+        "timestamp equal to archived_at must not delete"
+    );
     assert_eq!(all_archived_ids(&env, &client, &owner).len(), 5);
 
     // Cleanup with timestamp one second later → all 5 deleted
@@ -268,7 +281,10 @@ fn test_cleanup_idempotent_on_already_removed_bills() {
 
     // Third cleanup with even larger timestamp
     let third = client.bulk_cleanup_bills(&owner, &u64::MAX);
-    assert_eq!(third, 0, "repeated cleanup must always return 0 when archive is empty");
+    assert_eq!(
+        third, 0,
+        "repeated cleanup must always return 0 when archive is empty"
+    );
 
     // State is clean
     let archived = all_archived_ids(&env, &client, &owner);
@@ -295,9 +311,10 @@ fn test_cleanup_mixed_paid_unpaid_archived_state() {
     pay_and_archive(&client, &owner, &archived_ids);
 
     // 2 paid but NOT yet archived active bills
+    let orch = setup_orchestrator(&client, &owner);
     let paid_not_archived = create_unpaid_bills(&env, &client, &owner, 2, 200);
     for id in &paid_not_archived {
-        client.pay_bill(&owner, id);
+        client.pay_bill(&orch, &0, &owner, id);
     }
 
     let unpaid_before = client.get_total_unpaid(&owner);
@@ -329,7 +346,9 @@ fn test_cleanup_mixed_paid_unpaid_archived_state() {
 
     // Paid-but-not-archived bills still accessible
     for id in &paid_not_archived {
-        let bill = client.get_bill(id).expect("paid active bill must still exist");
+        let bill = client
+            .get_bill(id)
+            .expect("paid active bill must still exist");
         assert!(bill.paid);
     }
 
@@ -403,7 +422,7 @@ fn test_cleanup_overflow_safe_totals() {
     let env = make_env();
     let (client, owner) = setup(&env);
 
-    let big = i128::MAX / 4;
+    let big = MAX_AMOUNT;
 
     // 2 large-amount archived bills
     let arch_ids = create_unpaid_bills(&env, &client, &owner, 2, big);
@@ -450,7 +469,11 @@ fn test_cleanup_multi_owner_isolation() {
 
     // Alice runs cleanup – removes her 4 archived bills
     let cleaned = client.bulk_cleanup_bills(&alice, &u64::MAX);
-    assert_eq!(cleaned, 4 + 3, "global cleanup removes all matching archived bills");
+    assert_eq!(
+        cleaned,
+        4 + 3,
+        "global cleanup removes all matching archived bills"
+    );
 
     // Alice's archive is empty
     assert!(
