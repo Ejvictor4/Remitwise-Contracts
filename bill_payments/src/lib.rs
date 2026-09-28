@@ -475,6 +475,58 @@ pub struct PreUpgradeSnapshot {
     pub pause_admin: Option<Address>,
 }
 
+/// Read-only view of the pause-admin grant, including the time-bounded
+/// state that [`BillPayments::get_pause_admin_public`] deliberately omits.
+///
+/// # Why the grant state is exposed separately
+///
+/// The pause admin is stored in two independent instance entries:
+///
+/// - `PAUSE_ADM` — the address itself.
+/// - `PADM_GT` — the ledger timestamp at which the grant was last issued by
+///   `set_pause_admin` or `refresh_admin_grant`.
+///
+/// `get_pause_admin_public` returns only `PAUSE_ADM`, and that is deliberate:
+/// it must stay a *total* read so that a monitor, an indexer, or an incident
+/// responder can always learn **who** holds the role — including after the
+/// grant has lapsed, which is exactly the situation where knowing the
+/// address matters most. Folding the TTL check into that getter would make
+/// the read return `None` (or error) precisely when an operator needs it.
+///
+/// The TTL boundary is therefore reported here instead, so the three states
+/// are distinguishable without reaching into private storage:
+///
+/// | `granted_at` | `expired` | `usable` | meaning                                     |
+/// |--------------|-----------|----------|---------------------------------------------|
+/// | `None`       | `false`   | `true`\*  | legacy grant, TTL clock not started yet     |
+/// | `Some(..)`   | `false`   | `true`    | grant is live                               |
+/// | `Some(..)`   | `true`    | `false`   | grant lapsed: admin address known, writes  |
+/// |              |           |          | rejected with `AdminGrantExpired`           |
+///
+/// \* `usable` is `false` when no admin is set at all (bootstrap state).
+///
+/// This view is **side-effect free**: it never writes `PADM_GT`, so an
+/// unauthenticated caller cannot start (or restart) someone's grant clock by
+/// polling it. The lazy legacy migration lives on the write paths
+/// (`require_admin_grant_valid`), where it is gated by admin auth.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PauseAdminGrant {
+    /// Current pause admin (`PAUSE_ADM`), or `None` before bootstrap.
+    pub admin: Option<Address>,
+    /// Ledger timestamp the grant was last issued (`PADM_GT`), or `None` for
+    /// legacy state written before the TTL mechanism existed.
+    pub granted_at: Option<u64>,
+    /// `granted_at + ADMIN_GRANT_TTL`, or `None` when `granted_at` is `None`.
+    pub expires_at: Option<u64>,
+    /// `true` iff a grant timestamp exists and the ledger clock has reached
+    /// it (inclusive: the write path rejects on `now >= granted_at + TTL`).
+    pub expired: bool,
+    /// `true` iff the admin can still act right now — an address is set and
+    /// the grant has not lapsed. Mirrors `require_admin_grant_valid` exactly.
+    pub usable: bool,
+}
+
 /// Sane default for the admin-rotation timelock, used when a deployment
 /// doesn't have its own opinion. See [`Self::init_admin`] to configure a
 /// different window per deployment.
@@ -1420,9 +1472,73 @@ impl BillPayments {
     pub fn is_function_paused_public(env: Env, func: Symbol) -> bool {
         Self::is_function_paused(&env, func)
     }
+
+    /// Read the current pause admin.
+    ///
+    /// # Contract
+    ///
+    /// This is an **unauthenticated, total, side-effect-free read** of the
+    /// `PAUSE_ADM` instance entry. The following invariants are relied upon
+    /// by indexers, monitoring, and incident response, and are covered by
+    /// `tests_pause_admin_boundary` (issue #1833):
+    ///
+    /// 1. **Total** — every reachable state yields a value; the function
+    ///    never panics, never reverts, and never returns `Err`. `None` means
+    ///    exactly "no pause admin has been bootstrapped yet" and is not an
+    ///    error condition.
+    /// 2. **Pure** — it never writes instance storage (it creates neither the
+    ///    `PAUSE_ADM` nor the `PADM_GT` entry, and never rewrites an existing
+    ///    one) and never emits an event. In particular it does *not* lazily
+    ///    create `PADM_GT`, so polling it cannot start an admin's grant clock;
+    ///    that migration lives on the authenticated write paths.
+    /// 3. **TTL-independent** — the returned address does not change when the
+    ///    [`ADMIN_GRANT_TTL`] grant lapses. Expiry is enforced on the write
+    ///    paths only, so the address stays reportable (that is the whole
+    ///    point of knowing it) after a grant expires. Use
+    ///    [`Self::get_pause_admin_grant`] to distinguish "live" from "lapsed".
+    /// 4. **Incident-safe** — the read is not gated by the global pause, the
+    ///    per-function pause flags, or the kill switch. Monitoring must keep
+    ///    working while writes are halted.
+    /// 5. **Single source of truth** — the value equals `PAUSE_ADM` exactly as
+    ///    `pre_upgrade` snapshots it and `restore_from_snapshot` writes it
+    ///    back, so a snapshot/restore round trip is value-preserving.
+    ///
+    /// @param env Contract environment.
+    /// @return `Some(admin)` when a pause admin is configured, else `None`.
     pub fn get_pause_admin_public(env: Env) -> Option<Address> {
         Self::get_pause_admin(&env)
     }
+
+    /// Read the pause admin together with its grant/TTL state.
+    ///
+    /// Complements [`Self::get_pause_admin_public`] (see
+    /// [`PauseAdminGrant`] for the state table). Unauthenticated and
+    /// side-effect free, exactly like that getter; it adds no state
+    /// transition of its own.
+    ///
+    /// @param env Contract environment.
+    /// @return The current [`PauseAdminGrant`].
+    pub fn get_pause_admin_grant(env: Env) -> PauseAdminGrant {
+        let admin = Self::get_pause_admin(&env);
+        let granted_at: Option<u64> = env.storage().instance().get(&symbol_short!("PADM_GT"));
+        // Saturating so a corrupt/hostile `PADM_GT` can never wrap the
+        // deadline back into the past and un-expire a lapsed grant.
+        let expires_at = granted_at.map(|g| g.saturating_add(ADMIN_GRANT_TTL));
+        // Inclusive comparison, identical to `require_admin_grant_valid`:
+        // the grant is already dead on the exact second it reaches its TTL.
+        let expired = match expires_at {
+            Some(expires_at) => env.ledger().timestamp() >= expires_at,
+            None => false,
+        };
+        PauseAdminGrant {
+            admin,
+            granted_at,
+            expires_at,
+            expired,
+            usable: admin.is_some() && !expired,
+        }
+    }
+
     pub fn refresh_admin_grant(env: Env, caller: Address) -> Result<(), BillPaymentsError> {
         remitwise_common::require_no_active_kill_switch(&env)
             .unwrap_or_else(|e| soroban_sdk::panic_with_error!(&env, e));
@@ -4809,3 +4925,6 @@ mod tests_amount_precision;
 
 #[cfg(test)]
 mod pause_query_boundary_tests;
+
+#[cfg(test)]
+mod tests_pause_admin_boundary;
