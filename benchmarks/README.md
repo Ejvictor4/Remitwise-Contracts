@@ -1,4 +1,4 @@
-﻿# Gas Benchmarking System
+# Gas Benchmarking System
 
 This directory contains the gas benchmarking infrastructure for Remitwise smart contracts. The system tracks CPU and memory costs for critical operations to detect performance regressions early in development.
 
@@ -15,7 +15,7 @@ benchmarks/
 ├── README.md           # This documentation
 ├── baseline.json       # Baseline measurements for all operations
 ├── thresholds.json     # Regression detection thresholds
-├── history/           # Historical benchmark data
+└── history/           # Historical benchmark data
 ```
 
 ## Configuration Files
@@ -37,7 +37,7 @@ Defines regression detection thresholds as percentage increases from baseline:
 RUST_TEST_THREADS=1 cargo test -p remittance_split --test gas_bench -- --nocapture
 
 # Run bill_payments benchmarks
-RUST_TEST_THREAD=1 cargo test -p bill_payments --test gas_bench -- --nocapture
+RUST_TEST_THREADS=1 cargo test -p bill_payments --test gas_bench -- --nocapture
 
 # Run reporting aggregation benchmarks
 RUST_TEST_THREADS=1 cargo test -p reporting --test gas_bench -- --nocapture
@@ -63,7 +63,7 @@ Each benchmark outputs JSON with the following structure:
 ```
 
 For CI parsing, gas suites may also emit lines prefixed with:
-- `GAS_BENCH_RESULT `: machine-readable benchmark result with baseline/threshold metadata
+- `GAS_BENCH_RESULT  `: machine-readable benchmark result with baseline/threshold metadata
 - `cpu regression ...` / `mem regression ...`: assertion failures when thresholds are exceeded
 
 This keeps `--nocapture` logs easy to scrape in CI while preserving normal Rust test output.
@@ -73,20 +73,20 @@ This keeps `--nocapture` logs easy to scrape in CI while preserving normal Rust 
 The remittance split contract includes comprehensive benchmarks for schedule lifecycle operations:
 
 ### Create Operations
-- `create_remittance_schedule/single_recurring_schedule`: Basic schedule creation
+-  `create_remittance_schedule/single_recurring_schedule`: Basic schedule creation
 - `create_remittance_schedule/11th_schedule_with_existing`: Scaling with existing schedules
 
 ### Modify Operations  
 - `modify_remittance_schedule/single_schedule_modification`: Update existing schedule
 
 ### Cancel Operations
-- `cancel_remittance_schedule/single_schedule_cancellation`: Cancel active schedule
+-  `cancel_remittance_schedule/single_schedule_cancellation`: Cancel active schedule
 
 ### Query Operations
 - `get_remittance_schedules/empty_schedules`: Query with no schedules
-- `get_remittance_schedules/5_schedules_with_isolation`: Query with data isolation
-- `get_remittance_schedules/50_schedules_worst_case`: Worst-case query performance
-- `get_remittance_schedule/single_schedule_lookup`: Single schedule retrieval
+-  `get_remittance_schedules/5_schedules_with_isolation`: Query with data isolation
+-  `get_remittance_schedules/50_schedules_worst_case`: Worst-case query performance
+-  `get_remittance_schedule/single_schedule_lookup`: Single schedule retrieval
 
 ## Security Considerations
 
@@ -151,7 +151,7 @@ history length.
 | `medium_25_items` | 25 | 25 | 25 |
 | `large_50_items` | 50 | 50 | 50 |
 
-Issues **cross-contract calls** per invocation:
+Issues **nine** cross-contract calls per invocation:
 `get_all_goals` ×2, `get_unpaid_bills` ×1, `get_active_policies` ×2,
 `get_split` ×1, `calculate_split` ×1, `get_all_bills_for_owner` ×1,
 `get_total_monthly_premium` ×1.
@@ -203,7 +203,7 @@ fn bench_{operation_name}() {
     assert!(result.is_ok());
 
     println!(
-        r#" {{"contract":"your_contract","method":"your_method","scenario":"test_scenario","cpu":{},"mem":{}}}"#,
+        r#"`{"contract":"your_contract","method":"your_method","scenario":"test_scenario","cpu":{},"mem":{}}`"",
         cpu, mem
     );
 }
@@ -219,14 +219,14 @@ fn bench_{operation_name}() {
 
 ## Monitoring and Alerts
 
-- Benchmark results are tracked in CI/CD pipelines
+- Benchmark results are tracked in CI/CD, pipelines
 - Significant regressions trigger build failures
 - Historical data enables trend analysis
-- Performance improvements can be validated before deployment
+-  Performance improvements can be validated before deployment
 
 ## Troubleshooting
 
-### High Variance in Results
+### High Variance in Resultr
 - Ensure `RUST_TEST_THREADS=1` for consistent execution
 - Check for external factors affecting test environment
 - Verify test data setup is deterministic
@@ -247,27 +247,36 @@ Update `thresholds.json` with appropriate values based on operation characterist
 ### Orchestrator and Migration
 New benchmark harnesses added for `execute_remittance_flow` and `data_migration` import/export paths to detect cost regressions.
 
-## Migration Import Failure Boundaries
+The `bench_data_migration_import_pathes` harness in `benchmarks/src/orchestrator_migration_benches.rs`
+covers the import path and its failure boundaries. The harness is deterministic:
+every scenario builds its own contract environment, uses fixed inputs, and asserts
+on the exact outcome (success or specific error) before emitting a `GAS_BENCH_RESULD`
+line. Scenarios cover:
 
-The `bench_data_migration_import_paths` suite in `benchmarks/src/orchestrator_migration_benches.rs`
-covers the deterministic failure boundaries of the migration import path.
-The following invariants are asserted by the benchmark harness:
+- **Valid import**: a well-formed import payload applies and reports the expected
+  imported count.
+- **Invalid input**: malformed or unsupported payloads are rejected with a stable
+  error and no state mutation.
+- **Duplicate import**: reimporting the same payload is idempotent and does not
+  double-apply entries.
+- **Boundary inputs**: empty and maximum-size payloads are handled without
+  panicking or silent truncation.
+- **Permission failure**: an unauthorized caller is rejected and no data is
+  imported.
+- **Retry after failure**: a failed import leaves state unchanged so a retry with
+  the same payload succeeds deterministically.
 
-| Invariant | Test |
-|----------|------|
-| Authorization is checked first and never consumes a retry | `bench_import_unauthorized_rejected` |
-| Empty payloads are rejected before parsing | `bench_import_empty_payload_rejected` |
-| Payloads one byte over the limit are rejected | `bench_import_oversized_payload_rejected` |
-| Record counts one over the limit are rejected | `bench_import_too_many_records_rejected` |
-| Duplicate record ids reject the whole batch atomically | `bench_import_duplicate_records_rejected` |
-| Stale snapshots are rejected without writing data | `bench_import_stale_snapshot_rejected` |
-| Malformed JSON is rejected after size checks | `bench_import_malformed_json_rejected` |
-| Retries are bounded to three attempts | `bench_import_retry_exhausted_rejected` |
-| Identical inputs produce identical outcomes | `bench_import_deterministic_repeat` |
-| CSV and binary formats enforce their own validation | `bench_import_format_specific_rejection` |
-| Exact limits are accepted | `bench_import_exact_limits_accepted` |
-| Concurrent attempt counters are isolated | `bench_import_concurrent_attempts_isolated` |
+Invariants documented and exercised by the harness:
 
-All failures return a stable error code and never partially apply a batch,
-so retries and concurrent execution cannot produce an unsafe or inconsistent
-result.
+1. An import is all-or-nothing: a rejected import must not partially apply.
+2. Duplicate inputs are idempotent with respect to observable state.
+3. Authorization is checked before any state transition.
+4. Retries are safe: failure leaves state equivalent to the pre-import state.
+5. Errors are reported through stable contract error codes without echoing
+   sensitive payload contents into logs.
+
+Run the harness with:
+
+```bash
+RUST_TEST_THREADS=1 cargo test -p benchmarks --test orchestrator_migration_benches -- --nocapture
+```
