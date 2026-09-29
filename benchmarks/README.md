@@ -1,4 +1,4 @@
-# Gas Benchmarking System
+﻿# Gas Benchmarking System
 
 This directory contains the gas benchmarking infrastructure for Remitwise smart contracts. The system tracks CPU and memory costs for critical operations to detect performance regressions early in development.
 
@@ -15,7 +15,7 @@ benchmarks/
 ├── README.md           # This documentation
 ├── baseline.json       # Baseline measurements for all operations
 ├── thresholds.json     # Regression detection thresholds
-└── history/           # Historical benchmark data
+├── history/           # Historical benchmark data
 ```
 
 ## Configuration Files
@@ -37,7 +37,7 @@ Defines regression detection thresholds as percentage increases from baseline:
 RUST_TEST_THREADS=1 cargo test -p remittance_split --test gas_bench -- --nocapture
 
 # Run bill_payments benchmarks
-RUST_TEST_THREADS=1 cargo test -p bill_payments --test gas_bench -- --nocapture
+RUST_TEST_THREAD=1 cargo test -p bill_payments --test gas_bench -- --nocapture
 
 # Run reporting aggregation benchmarks
 RUST_TEST_THREADS=1 cargo test -p reporting --test gas_bench -- --nocapture
@@ -146,12 +146,12 @@ history length.
 ### get_financial_health_report
 
 | Scenario | Goals | Bills | Policies |
-|----------|-------|-------|---------|
+|----------|-------|-------|----------|
 | `small_5_items` | 5 | 5 | 5 |
 | `medium_25_items` | 25 | 25 | 25 |
 | `large_50_items` | 50 | 50 | 50 |
 
-Issues **nine** cross-contract calls per invocation:
+Issues **cross-contract calls** per invocation:
 `get_all_goals` ×2, `get_unpaid_bills` ×1, `get_active_policies` ×2,
 `get_split` ×1, `calculate_split` ×1, `get_all_bills_for_owner` ×1,
 `get_total_monthly_premium` ×1.
@@ -159,7 +159,7 @@ Issues **nine** cross-contract calls per invocation:
 ### archive_old_reports
 
 | Scenario | Stored reports |
-|----------|---------------|
+|----------|----------------|
 | `5_stored_reports` | 5 |
 | `25_stored_reports` | 25 |
 | `50_stored_reports` | 50 |
@@ -203,7 +203,7 @@ fn bench_{operation_name}() {
     assert!(result.is_ok());
 
     println!(
-        r#"{{"contract":"your_contract","method":"your_method","scenario":"test_scenario","cpu":{},"mem":{}}}"#,
+        r#" {{"contract":"your_contract","method":"your_method","scenario":"test_scenario","cpu":{},"mem":{}}}"#,
         cpu, mem
     );
 }
@@ -246,3 +246,28 @@ Update `thresholds.json` with appropriate values based on operation characterist
 
 ### Orchestrator and Migration
 New benchmark harnesses added for `execute_remittance_flow` and `data_migration` import/export paths to detect cost regressions.
+
+## Migration Import Failure Boundaries
+
+The `bench_data_migration_import_paths` suite in `benchmarks/src/orchestrator_migration_benches.rs`
+covers the deterministic failure boundaries of the migration import path.
+The following invariants are asserted by the benchmark harness:
+
+| Invariant | Test |
+|----------|------|
+| Authorization is checked first and never consumes a retry | `bench_import_unauthorized_rejected` |
+| Empty payloads are rejected before parsing | `bench_import_empty_payload_rejected` |
+| Payloads one byte over the limit are rejected | `bench_import_oversized_payload_rejected` |
+| Record counts one over the limit are rejected | `bench_import_too_many_records_rejected` |
+| Duplicate record ids reject the whole batch atomically | `bench_import_duplicate_records_rejected` |
+| Stale snapshots are rejected without writing data | `bench_import_stale_snapshot_rejected` |
+| Malformed JSON is rejected after size checks | `bench_import_malformed_json_rejected` |
+| Retries are bounded to three attempts | `bench_import_retry_exhausted_rejected` |
+| Identical inputs produce identical outcomes | `bench_import_deterministic_repeat` |
+| CSV and binary formats enforce their own validation | `bench_import_format_specific_rejection` |
+| Exact limits are accepted | `bench_import_exact_limits_accepted` |
+| Concurrent attempt counters are isolated | `bench_import_concurrent_attempts_isolated` |
+
+All failures return a stable error code and never partially apply a batch,
+so retries and concurrent execution cannot produce an unsafe or inconsistent
+result.
