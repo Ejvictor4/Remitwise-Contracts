@@ -1277,6 +1277,7 @@ impl BillPayments {
 
     /// @notice Schedule the earliest time the contract may be unpaused.
     /// @dev Time-locks unpause to a future `at_timestamp` (ledger timestamp seconds).
+    ///      The contract must already be globally paused; scheduling while active is rejected.
     /// @return Ok(()) on success, otherwise `Error::InvalidAmount` or `Error::UnauthorizedPause`.
     pub fn schedule_unpause(env: Env, caller: Address, at_timestamp: u64) -> Result<(), Error> {
         remitwise_common::require_no_active_kill_switch(&env)
@@ -1286,6 +1287,9 @@ impl BillPayments {
         let admin = Self::get_pause_admin(&env).ok_or(BillPaymentsError::UnauthorizedPause)?;
         if admin != caller {
             return Err(BillPaymentsError::UnauthorizedPause);
+        }
+        if !Self::get_global_paused(&env) {
+            return Err(BillPaymentsError::ContractPaused);
         }
         if at_timestamp <= env.ledger().timestamp() {
             return Err(BillPaymentsError::InvalidAmount);
@@ -3392,11 +3396,11 @@ impl BillPayments {
         if bill.external_ref != validated_ext_ref {
             // Claim new ref first if provided
             if let Some(ref new_ref) = validated_ext_ref {
-                Self::claim_external_ref(&env, &caller, new_ref, bill_id)?;
+                Self::claim_external_ref(env, &caller, new_ref, bill_id)?;
             }
             // Release old ref only after new ref is successfully claimed
             if let Some(ref old_ref) = bill.external_ref {
-                Self::release_external_ref(&env, &caller, old_ref);
+                Self::release_external_ref(env, &caller, old_ref);
             }
         }
 
@@ -3543,8 +3547,8 @@ impl BillPayments {
     ///
     /// # Security
     /// Requires `owner.require_auth()`. The archived-bill index is per-owner, so
-    /// results are scoped to `owner` and no cross-owner leakage can occur via
-    /// cursor manipulation.
+    /// results are scoped to `owner` and no cross-owner leakage can occur via cursor
+    /// manipulation.
     pub fn get_archived_bills_page(
         env: Env,
         owner: Address,
@@ -3579,7 +3583,7 @@ impl BillPayments {
         let mut next_cursor: u32 = 0;
 
         if has_next {
-            // next_cursor = last item on the current page (before truncation)
+            // next_cursor = last item on the current page (not the first skipped).
             let last_idx = effective_limit - 1;
             if let Some(bill) = staging.get(last_idx) {
                 next_cursor = bill.id;
@@ -4150,7 +4154,7 @@ impl BillPayments {
             // bill before any state change).
             use crate::state::{check_invariants, BillState};
             BillState::validate_transition(&bill, false, BillState::Paid, "batch_pay_bills")?;
-            check_invariants(&env, &bill, false)?;
+            check_invariants(env, &bill, false)?;
 
             // Reject settlement outside the allowed window (due date plus the
             // 30-day grace period): a stale obligation in the batch fails the
@@ -4216,7 +4220,7 @@ impl BillPayments {
             paid_bill.paid_at = Some(current_time);
 
             // Checked, never saturating: a delta overflow would silently
-            // truncate the owner's unpaid total.
+            // truncate the owner's unpaid balance.
             total_unpaid_delta = total_unpaid_delta
                 .checked_sub(unpaid_delta_item)
                 .ok_or(BillPaymentsError::AmountOverflow)?;
@@ -4811,3 +4815,6 @@ mod test_state_invariants;
 
 #[cfg(test)]
 mod tests_amount_precision;
+
+#[cfg(test)]
+mod pause_query_boundary_tests;
