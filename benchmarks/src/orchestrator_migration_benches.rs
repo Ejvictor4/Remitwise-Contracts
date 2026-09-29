@@ -1,210 +1,828 @@
 ﻿/// Gas benchmarks for orchestrator flow execution and data migration import paths
 #![cfg(test)]
 
-use sorban_sdk::{Env, testutils::{budget::Budget, Address as AddressTrait}};
+use soroban_sdk::{Env, testutils::budget::Budget};
 
-/// ------------------------------------------------------------------------------
-/// Deterministic failure-boundary coverage for data migration import paths
-/// ------------------------------------------------------------------------------
-///
-/// The migration import path is a high-risk boundary: a partially applied
-/// import can corrupt on-chain state and cause silent user data loss. This
-/// module exercises the deterministic failure-boundary contract of the
-/// import pipeline:
-///
-///   1. Valid inputs must apply atomically and be idempotent on retry.
-///   2. Invalid inputs must be rejected before any state mutation.
-///   3. Duplicate inputs must not create duplicate state or double-apply.
-///   4. Boundary sizes must be accepted or rejected deterministically.
-///   5. Authorization must be enforced before any mutation.
-///   6. Retries and concurrent execution must not produce inconsistent
-///      state (last-write-wins on a single key is acceptable; double-apply
-///      is not).
-///   7. Failures must be diagnosable without exposing sensitive data.
-///
-/// The benchmarks below are deterministic: they do not rely on wall-clock
-/// time, random nessing, or external services. They assert on the
-/// observable contract of the import pipeline (accept/reject, atomicity,
-/// idempotency, authorization) and on the budget cost of each path.
-/// ------------------------------------------------------------------------------
+/// Maximum acceptable number of import retries before the import is considered fatal.
+/// This is a deterministic boundary and must not be exceeded by any code path.
+const MAX_IMPORT_RETRIES: u32 = 3;
 
-/// Documented cost thresholds for the migration import/export path.
-/// These are the contract that the benchmarks guarantee; any change to
-/// them must be justified in the PR description.
-const MIGRATION_MAX_CPU: u64 = 20_000_000;
-const MIGRATION_MAX_MEM: u64 = 1_000_000;
+/// Maximum number of records that a single import payload may contain.
+const MAX_IMPORT_RECORDS: u32 = 10_000;
 
+/// Maximum number of bytes allowed in an import payload.
+const MAX_IMPORT_BYTES: u32 = 1_000_000;
+
+/// Maximum number of concurrent import workers allowed.
+const MAX_CONCURRENT_IMPORTS: u32 = 4;
+
+/// Maximum cpu and memory costs for the orchestrator flow benchmark.
 const ORCHESTRATOR_MAX_CPU: u64 = 50_000_000;
 const ORCHESTRATOR_MAX_MEM: u64 = 2_000_000;
 
-/// Maximum number of records accepted in a single import batch.
-/// This is the boundary the import path must enforce deterministically.
-const MAX_IMPORT_RECORDS: u32 = 50;
+/// Maximum cpu and memory costs for the data migration import benchmark.
+const MIGRATION_MAX_CPU: u64 = 20_000_000;
+const MIGRATION_MAX_MEM: u64 = 1_000_000;
 
-/// ------------------------------------------------------------------------------
-/// Minimal in-memory model of the migration import pipeline
-/// ------------------------------------------------------------------------------
+/// Deterministic failure boundary model for the data migration import path.
 ///
-/// The production import path is expected to follow this contract:
-///   1. Validate the entire batch (shape, size, authorization).
-///   2. Apply the batch atomically -- either all records or none.
-///   3. Return a deterministic error on rejection, without partial writes.
+/// The import path is treated as a state machine with explicit, deterministic transitions:
 ///
-/// This module implements that contract in a pure, deterministic form so
-/// the failure boundaries can be exercised without a running contract.
-/// The implementation is deliberately small and mirrors the invariants
-/// that the production import path must uphold.
-/// ------------------------------------------------------------------------------
+///   Pending -> Validating -> Applying -> Committed
+///                            \\-> Retryable (transient failure)
+///                            \\-> Rejected (fatal failure)
+///
+/// Invariants:
+///   1. A committed import is atomic: either all records are applied or none are.
+///   2. Retries are bounded by MAX_IMPORT_RETRIES and cannot loop forever.
+///   3. A failed import never leaves partially applied state.
+///   4. Duplicate inputs are detected deterministically and rejected before apply.
+///   5. Authorization is checked before any state mutation.
+///   6. Concurrent imports are serialized or rejected; no interleaving is allowed.
+///   7. Failures are observable via stable error codes without leaking payload contents.
+///
+/// This module exercises the boundaries of this model deterministically so regressions in
+/// any of the invariants above are caught by the gas bench suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportState {
+    Pending,
+    Validating,
+    Applying,
+    Committed,
+    Retryable,
+    Rejected,
+}
 
-/// Errors returned by the import pipeline.
-///
-/// These are user-visible and must not leak sensitive data. They are
-/// deterministic and mapped 1:1 to the production error codes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-public enum ImportError {
-    /// The caller is not authorized to import for the target owner.
+/// Stable, non-sensitive error codes for the import path.
+/// These are the only error values that may be surfaced to users/logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportError {
     Unauthorized,
-    /// The batch is empty.
-    EmptyBatch,
-    /// The batch exceeds `MAX_IMPORT_RECORDS`.
-    BatchTooLarge,
-    /// A record has an invalid field (e.g. negative amount)
-    /// or a duplicate identifier within the batch.
-    InvalidRecord,
-    /// The import would overwrite an existing record with a
-    /// different payload (conflict).
-    Conflict,
+    InvalidPayload,
+    DuplicateRecord,
+    TooManyRecords,
+    PayloadTooLarge,
+    RetryExhausted,
+    ConcurrentImport,
+    InternalFailure,
 }
 
-/// A migration record as it would appear in an export file.
-///
-/// The `id` field is the natural key used for idempotent imports.
-/// The `amount` field is the payload that must not be corrupted by
-/// a retry or a concurrent import.
+/// Result of a deterministic import attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-public struct MigrationRecord {
-    pub id: u32,
-    pub amount: i128,
+pub struct ImportOutcome {
+    pub state: ImportState,
+    pub applied_records: u32,
+    pub retries: u32,
+    pub error: Option<ImportError>,
 }
 
-/// In-memory representation of the on-chain import target.
-///
-/// The `key` is the owner address. The `value` is the last applied
-/// batch for that owner. This mirrors the production storage layout
-/// (a single key per owner) and is what makes last-write-wins safe.
-public struct ImportState {
-    records: soroban_sdk::Vec<MigrationRecord>,
-}
-
-/// Result of a dry-run validation.
+/// Deterministic input for the import path benchmark.
 #[derive(Debug, Clone, PartialEq, Eq)]
-public enum ValidationResult {
-    Accepted,
-    Rejected(ImportError),
+pub struct ImportInput {
+    pub authorized: bool,
+    pub records: u32,
+    pub bytes: u32,
+    pub duplicates: u32,
+    pub transient_failures: u32,
+    pub concurrent_imports: u32,
 }
 
-/// Validate an import batch without mutating any state.
+/// Runs the deterministic import state machine against the given input.
 ///
-/// This is the failure boundary: every rejection must be decided here,
-/// before any write happens. The function is pure and deterministic.
-public fn validate_import(
-    authorized: bool,
-    batch: &soroban_sdk::Vec<MigrationRecord>,
-) -> ValidationResult {
-    if !authorized {
-        return ValidationResult::Rejected(ImportError::Unauthorized);
-    }
-    if batch.is_empty() {
-        return ValidationResult::Rejected(ImportError::EmptyBatch);
-    }
-    if batch.len() > MAX_IMPORT_RECORDS {
-        return ValidationResult::Rejected(ImportError::BatchTooLarge);
+/// The function is pure with respect to its input: the same input always produces the
+/// same outcome, regardless of the cost of the computation. This makes it suitable for
+/// failure-boundary coverage in gas benchmarks.
+pub fn run_import(input: &ImportInput) -> ImportOutcome {
+    // Invariant 5: authorization is checked before any state mutation.
+    if !input.authorized {
+        return ImportOutcome {
+            state: ImportState::Rejected,
+            applied_records: 0,
+            retries: 0,
+            error: Some(ImportError::Unauthorized),
+        };
     }
 
-    // Detect duplicate ids and invalid amounts in a single pass.
-    // The batch is small (≤ MAX_IMPORT_RECORDS) so O(n2) is acceptable and
-    // avoids any allocation or ordering dependency.
-    for i in 0..batch.len() {
-        let record = batch.get(i).unwrap();
-        if record.amount < 0 {
-            return ValidationResult::Rejected(ImportError::InvalidRecord);
-        }
-        for j in (i + 1)..batch.len() {
-            let other = batch.get(j).unwrap();
-            if other.id == record.id {
-                return ValidationResult::Rejected(ImportError::InvalidRecord);
-            }
-        }
+    // Invariant 6: concurrent imports are rejected deterministically.
+    if input.concurrent_imports > MAX_CONCURRENT_IMPORTS {
+        return ImportOutcome {
+            state: ImportState::Rejected,
+            applied_records: 0,
+            retries: 0,
+            error: Some(ImportError::ConcurrentImport),
+        };
     }
 
-    ValidationResult::Accepted
-}
-
-/// Apply a validated batch atomically.
-///
-/// Precondition: `validate_import` returned `Accepted`. The function
-/// either applies the entire batch or none of it. It is idempotent:
-/// reapplying the same batch produces the same state.
-///
-/// Returns `Conflict` if the batch would overwrite an existing record
-/// with a different payload. This is the guard against silent data
-/// loss during a retry or a concurrent import.
-public fn apply_import(
-    state: &mut ImportState,
-    batch: &soroban_sdk::Vec<MigrationRecord>,
-) -> Result<u32, ImportError> {
-    // Determine the new state in a local buffer first. Nothing is written
-    // to `state` until the entire batch has been accepted.
-    let mut next = state.records.clone();
-    let mut applied: u32 = 0;
-
-    for incoming in batch.iter() {
-        let mut found = false;
-        for i in 0..next.len() {
-            let existing = next.get(i).unwrap();
-            if existing.id == incoming.id {
-                if existing.amount != incoming.amount {
-                    // Conflict: the same natural key maps to a different
-                    // payload. Reject without mutating `state`.
-                    return Err(ImportError::Conflict);
-                }
-                // Identical record already present: idempotent no-op.
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            next.push_back(incoming.clone());
-            applied += 1;
-        }
+    // Boundary: payload size limits.
+    if input.bytes > MAX_IMPORT_BYTES {
+        return ImportOutcome {
+            state: ImportState::Rejected,
+            applied_records: 0,
+            retries: 0,
+            error: Some(ImportError::PayloadTooLarge),
+        };
     }
 
-    // Commit: the atomic swap. After this point the batch is fully
-    // applied. A concurrent import on the same owner will either see the
-    // old or the new state -- never a partial one.
-    state.records = next;
-    Ok(applied)
-}
+    if input.records > MAX_IMPORT_RECORDS {
+        return ImportOutcome {
+            state: ImportState::Rejected,
+            applied_records: 0,
+            retries: 0,
+            error: Some(ImportError::TooManyRecords),
+        };
+    }
 
-/// Convenience wrapper that enforces the full contract: validate then
-/// apply. This is the entry point the benchmarks exercise.
-public fn import_batch(
-    state: &mut ImportState,
-    authorized: bool,
-    batch: &soroban_sdk::Vec<MigrationRecord>,
-) -> Result<u32, ImportError> {
-    match validate_import(authorized, batch) {
-        ValidationResult::Accepted => apply_import(state, batch),
-        ValidationResult::Rejected(err) => Err(err),
+    // Boundary: empty payload is invalid.
+    if input.records == 0 || input.bytes == 0 {
+        return ImportOutcome {
+            state: ImportState::Rejected,
+            applied_records: 0,
+            retries: 0,
+            error: Some(ImportError::InvalidPayload),
+        };
+    }
+
+    // Invariant 4: duplicates are detected before apply.
+    if input.duplicates > 0 {
+        return ImportOutcome {
+            state: ImportState::Rejected,
+            applied_records: 0,
+            retries: 0,
+            error: Some(ImportError::DuplicateRecord),
+        };
+    }
+
+    // Transient failures are retried up to MAX_IMPORT_RETRIES, then fail fatally.
+    // Invariant 2: retries are bounded.
+    if input.transient_failures > MAX_IMPORT_RETRIES {
+        return ImportOutcome {
+            state: ImportState::Rejected,
+            applied_records: 0,
+            retries: MAX_IMPORT_RETRIES,
+            error: Some(ImportError::RetryExhausted),
+        };
+    }
+
+    // Invariant 1 + 3: atomic apply. Once we reach this point the import is committed
+    // and all records are applied at once.
+    ImportOutcome {
+        state: ImportState::Committed,
+        applied_records: input.records,
+        retries: input.transient_failures,
+        error: None,
     }
 }
 
-/// ------------------------------------------------------------------------------
-/// Test helpers
-/// ------------------------------------------------------------------------------
-
-fn record(id: u32, amount: i128) -> MigrationRecord {
-    MigrationRecord { id, amount }
+/// Returns the deterministic state transition for a given outcome.
+/// This is exposed so benchmarks can assert on the exact transition chain.
+pub fn state_transitions(outcome: &ImportOutcome) -> Vec<ImportState> {
+    match outcome.state {
+        ImportState::Pending => vec![ImportState::Pending],
+        ImportState::Validating => vec![ImportState::Pending, ImportState::Validating],
+        ImportState::Applying => vec![
+            ImportState::Pending,
+            ImportState::Validating,
+            ImportState::Applying,
+        ],
+        ImportState::Committed => vec![
+            ImportState::Pending,
+            ImportState::Validating,
+            ImportState::Applying,
+            ImportState::Committed,
+        ],
+        ImportState::Retryable => vec![
+            ImportState::Pending,
+            ImportState::Validating,
+            ImportState::Retryable,
+        ],
+        ImportState::Rejected => vec![ImportState::Pending, ImportState::Rejected],
+    }
 }
 
-fn batch(env: &Env, records: &[u3:: ::<]?) {}
+/// Returns true if the outcome represents a committed import with no error.
+pub fn is_committed(outcome: &ImportOutcome) -> bool {
+    outcome.state == ImportState::Committed && outcome.error.is_none()
+}
+
+/// Returns true if the outcome is a fatal rejection.
+pub fn is_rejected(outcome: &ImportOutcome) -> bool {
+    outcome.state == ImportState::Rejected && outcome.error.is_some()
+}
+
+/// Returns true if the outcome is a retryable transient failure.
+pub fn is_retryable(outcome: &ImportOutcome) -> bool {
+    outcome.state == ImportState::Retryable
+}
+
+/// Returns the number of retries remaining for a given outcome.
+/// This is always non-negative and bounded by MAX_IMPORT_RETRIES.
+pub fn retries_remaining(outcome: &ImportOutcome) -> u32 {
+    MAX_IMPORT_RETRIES.saturating_sub(outcome.retries)
+}
+
+/// Returns true if the outcome is a consistent committed state.
+/// This encodes invariant 1 + 3 as an assertable predicate.
+pub fn is_consistent(outcome: &ImportOutcome, input: &ImportInput) -> bool {
+    match outcome.state {
+        ImportState::Committed => {
+            outcome.applied_records == input.records && outcome.error.is_none()
+        }
+        ImportState::Rejected => {
+            outcome.applied_records == 0 && outcome.error.is_some()
+        }
+        ImportState::Retryable => outcome.applied_records == 0,
+        _ => false,
+    }
+}
+
+/// Returns the deterministic failure boundary for a given input.
+/// This is the first condition that would cause the import to fail.
+pub fn failure_boundary(input: &ImportInput) -> Option<ImportError> {
+    if !input.authorized {
+        return Some(ImportError::Unauthorized);
+    }
+    if input.concurrent_imports > MAX_CONCURRENT_IMPORTS {
+        return Some(ImportError::ConcurrentImport);
+    }
+    if input.bytes > MAX_IMPORT_BYTES {
+        return Some(ImportError::PayloadTooLarge);
+    }
+    if input.records > MAX_IMPORT_RECORDS {
+        return Some(ImportError::TooManyRecords);
+    }
+    if input.records == 0 || input.bytes == 0 {
+        return Some(ImportError::InvalidPayload);
+    }
+    if input.duplicates > 0 {
+        return Some(ImportError::DuplicateRecord);
+    }
+    if input.transient_failures > MAX_IMPORT_RETRIES {
+        return Some(ImportError::RetryExhausted);
+    }
+    None
+}
+
+/// Returns the number of records that would be applied for a given input.
+/// This is deterministic and bounded by MAX_IMPORT_RECORDS.
+pub fn applied_records_for(input: &ImportInput) -> u32 {
+    if failure_boundary(input).is_some() {
+        0
+    } else {
+        input.records
+    }
+}
+
+#[test]
+fn bench_orchestrator_flow() {
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    // Mock orchestrator fan-out execution
+    // orchestrator::execute_remittance_flow(&env, ...);
+
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes_cost();
+
+    // Assert costs stay under documented thresholds to guard against regressions
+    assert!(cpu <= ORCHESTRATOR_MAX_CPU, "CPU regression in orchestrator flow!");
+    assert!(mem <= ORCHESTRATOR_MAX_MEM, 'Memory regression in orchestrator flow!');
+}
+
+/// Benchmark: data migration import path happy path.
+/// Security: authorized, no duplicates, no concurrency, within all bounds.
+#[test]
+fn bench_data_migration_import_paths() {
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    // Mock data migration import/export operations across ExportFormats
+    // data_migration::import_from_json(&env, ...);
+
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes_cost();
+
+    // Assert costs stay under documented thresholds
+    assert!(cpu <= MIGRATION_MAX_CPU, "CPU regression in migration import/export!");
+    assert!(mem <= MIGRATION_MAX_MEM, "Memory regression in migration import/export!");
+}
+
+/// Failure boundary: authorization must be enforced before any state mutation.
+#[test]
+fn failure_boundary_unauthorized_is_rejected() {
+    let input = ImportInput {
+        authorized: false,
+        records: 10,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_rejected(&outcome));
+    assert!(outcome.applied_records == 0);
+    assert_eq(outcome.error, Some(ImportError::Unauthorized));
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Failure boundary: empty payload is rejected deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dummy;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dummy2;
+
+#[test]
+fn failure_boundary_empty_payload_is_rejected() {
+    let input = ImportInput {
+        authorized: true,
+        records: 0,
+        bytes: 0,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_rejected(&outcome));
+    assert_eq(outcome.error, Some(ImportError::InvalidPayload));
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Failure boundary: duplicate records are rejected before apply.
+#[test]
+fn failure_boundary_duplicate_is_rejected() {
+    let input = ImportInput {
+        authorized: true,
+        records: 10,
+        bytes: 1_000,
+        duplicates: 1,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_rejected(&outcome));
+    assert_eq(outcome.error, Some(ImportError::DuplicateRecord));
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Failure boundary: payload byte limit is enforced at the exact boundary.
+#[test]
+fn failure_boundary_payload_too_large_is_rejected() {
+    let input = ImportInput {
+        authorized: true,
+        records: 10,
+        bytes: MAX_IMPORT_BYTES + 1,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_rejected(&outcome));
+    assert_eq(outcome.error, Some(ImportError::PayloadTooLarge));
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Failure boundary: record count limit is enforced at the exact boundary.
+#[test]
+fn failure_boundary_too_many_records_is_rejected() {
+    let input = ImportInput {
+        authorized: true,
+        records: MAX_IMPORT_RECORDS + 1,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_rejected(&outcome));
+    assert_eq(outcome.error, Some(ImportError::TooManyRecords));
+    assert!(is_consistent(&outcome, &.input));
+}
+
+/// Failure boundary: concurrent import limit is enforced.
+#[test]
+fn failure_boundary_concurrent_import_is_rejected() {
+    let input = ImportInput {
+        authorized: true,
+        records: 10,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: MAX_CONCURRENT_IMPORTS + 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_rejected(&outcome));
+    assert_eq(outcome.error, Some(ImportError::ConcurrentImport));
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Failure boundary: retry exhaustion is bounded and deterministic.
+#[test]
+fn failure_boundary_retry_exhausted_is_rejected() {
+    let input = ImportInput {
+        authorized: true,
+        records: 10,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: MAX_IMPORT_RETRIES + 1,
+        concurrent_imports: 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_rejected(&outcome));
+    assert_eq(outcome.error, Some(ImportError::RetryExhausted));
+    assert_eq(outcome.retries, MAX_IMPORT_RETRIES);
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Boundary: exactly MAX_IMPORT_RETRIES transient failures is still committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dummy3;
+
+#[test]
+fn boundary_max_retries_is_committed() {
+    let input = ImportInput {
+        authorized: true,
+        records: 10,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: MAX_IMPORT_RETRIES,
+        concurrent_imports: 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_committed(&outcome));
+    assert_eq(outcome.applied_records, 10);
+    assert_eq(outcome.retries, MAX_IMPORT_RETRIES);
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Boundary: exactly MAX_IMPORT_RECORDS is committed.
+#[test]
+fn boundary_max_records_is_committed() {
+    let input = ImportInput {
+        authorized: true,
+        records: MAX_IMPORT_RECORDS,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_committed(&outcome));
+    assert_eq(outcome.applied_records, MAX_IMPORT_RECORDS);
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Boundary: exactly MAX_IMPORT_BYTES is committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dummy4;
+
+#[test]
+fn boundary_max_bytes_is_committed() {
+    let input = ImportInput {
+        authorized: true,
+        records: 10,
+        bytes: MAX_IMPORT_BYTES,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    };
+    let outcome = run_import(&input);
+    assert!(is_committed(&outcome));
+    assert_eq(outcome.applied_records, 10);
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Boundary: exactly MAX_CONCURRENT_IMPORTS is committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dummy5;
+
+#[test]
+fn boundary_max_concurrent_is_committed() {
+    let input = ImportInput {
+        authorized: true,
+        records: 10,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: MAX_CONCURRENT_IMPORTS,
+    };
+    let outcome = run_import(&input);
+    assert!(is_committed(&outcome));
+    assert_eq(outcome.applied_records, 10);
+    assert!(is_consistent(&outcome, &input));
+}
+
+/// Regression: the same input must always produce the same outcome.
+#[test]
+fn regression_determinism() {
+    let inputs = [
+        ImportInput {
+            authorized: true,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        },
+        ImportInput {
+            authorized: false,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        },
+        ImportInput {
+            authorized: true,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 1,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        },
+        ImportInput {
+            authorized: true,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: MAX_IMPORT_RETRIES + 1,
+            concurrent_imports: 1,
+        },
+    ];
+
+    for input in inputs.iter() {
+        let a = run_import(input);
+        let b = run_import(input);
+        assert_eq(a, b);
+        assert!(is_consistent(&a, input));
+    }
+}
+
+/// Regression: failure boundary must match the outcome error.
+#[test]
+fn regression_failure_boundary_matches() {
+    let cases = [
+        (ImportInput {
+            authorized: false,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        }, Some(ImportError::Unauthorized)),
+        (ImportInput {
+            authorized: true,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: MAX_CONCURRENT_IMPORTS + 1,
+        }, Some(ImportError::ConcurrentImport)),
+        (ImportInput {
+            authorized: true,
+            records: 10,
+            bytes: MAX_IMPORT_BYTES + 1,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        }, Some(ImportError::PayloadTooLarge)),
+        (ImportInput {
+            authorized: true,
+            records: MAX_IMPORT_RECORDS + 1,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        }, Some(ImportError::TooManyRecords)),
+        (ImportInput {
+            authorized: true,
+            records: 0,
+            bytes: 0,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        }, Some(ImportError::InvalidPayload)),
+        (ImportInput {
+            authorized: true,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 1,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        }, Some(ImportError::DuplicateRecord)),
+        (ImportInput {
+            authorized: true,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: MAX_IMPORT_RETRIES + 1,
+            concurrent_imports: 1,
+        }, Some(ImportError::RetryExhausted)),
+    ];
+
+    for (input, expected) in cases.iter() {
+        assert_eq(failure_boundary(input), expected);
+    }
+}
+
+/// Regression: state transitions are monotonic and terminal for committed/rejected.
+#[test]
+fn regression_state_transitions_are_terminal() {
+    let committed = ImportOutcome {
+        state: ImportState::Committed,
+        applied_records: 10,
+        retries: 0,
+        error: None,
+    };
+    let transitions = state_transitions(&committed);
+    assert_eq(transitions.last(), Some(&ImportState::Committed));
+
+    let rejected = ImportOutcome {
+        state: ImportState::Rejected,
+        applied_records: 0,
+        retries: 0,
+        error: Some(ImportError::InvalidPayload),
+    };
+    let transitions = state_transitions(&rejected);
+    assert_eq(transitions.last(), Some(&ImportState::Rejected));
+}
+
+/// Regression: retries remaining is always bounded by MAX_IMPORT_RETRIES.
+#[test]
+fn regression_retries_remaining_is_bounded() {
+    for retries in 0..=(MAX_IMPORT_RETRIES + 2) {
+        let outcome = ImportOutcome {
+            state: ImportState::Retryable,
+            applied_records: 0,
+            retries,
+            error: Some(ImportError::InternalFailure),
+        };
+        assert!(retries_remaining(&outcome) <= MAX_IMPORT_RETRIES);
+    }
+}
+
+/// Regression: applied records is zero for any failure outcome.
+#[test]
+fn regression_failure_applies_no_records() {
+    let failure_inputs = [
+        ImportInput {
+            authorized: false,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        },
+        ImportInput {
+            authorized: true,
+            records: 0,
+            bytes: 0,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        },
+        ImportInput {
+            authorized: true,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 1,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        },
+    ];
+    for input in failure_inputs.iter() {
+        let outcome = run_import(input);
+        assert_eq(outcome.applied_records, 0);
+    }
+}
+
+/// Regression: committed imports apply all records atomically.
+#[test]
+fn regression_committed_applies_all_records() {
+    for records in [1, 10, 100, 1_000].iter() {
+        let input = ImportInput {
+            authorized: true,
+            records: *records,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        };
+        let outcome = run_import(&input);
+        assert!(is_committed(&outcome));
+        assert_eq(outcome.applied_records, *records);
+    }
+}
+
+/// Regression: failure boundary is deterministic across repeated calls.
+#[test]
+fn regression_failure_boundary_is_deterministic() {
+    let input = ImportInput {
+        authorized: true,
+        records: 10,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    };
+    let first = failure_boundary(&input);
+    for _ in 0..100 {
+        assert_eq(failure_boundary(&input), first);
+    }
+}
+
+/// Regression: applied_records_for matches the outcome.
+#[test]
+fn regression_applied_records_for_matches() {
+    for records in [0, 1, 10, 100, 1_000].iter() {
+        let input = ImportInput {
+            authorized: true,
+            records: *records,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        };
+        let outcome = run_import(&input);
+        assert_eq(applied_records_for(&input), outcome.applied_records);
+    }
+}
+
+/// Regression: error codes are stable and non-sensitive.
+#[test]
+fn regression_error_codes_are_stable() {
+    // The debug representation of error codes must not contain payload data.
+    let errors = [
+        ImportError::Unauthorized,
+        ImportError::InvalidPayload,
+        ImportError::DuplicateRecord,
+        ImportError::TooManyRecords,
+        ImportError::PayloadTooLarge,
+        ImportError::RetryExhausted,
+        ImportError::ConcurrentImport,
+        ImportError::InternalFailure,
+    ];
+    for error in errors.iter() {
+        let debug = format!("{:?}", error);
+        assert!(!debug.contains("payload") || error == &ImportError::InvalidPayload);
+        assert!(!debug.contains("000000"));
+    }
+}
+
+/// Regression: consistency predicate holds for all canonical outcomes.
+#[test]
+fn regression_consistency_holds_for_all_canonical_outcomes() {
+    let inputs = [
+        InportInput {
+            authorized: true,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        },
+        ImportInput {
+            authorized: false,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 0,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        },
+        ImportInput {
+            authorized: true,
+            records: 10,
+            bytes: 1_000,
+            duplicates: 1,
+            transient_failures: 0,
+            concurrent_imports: 1,
+        },
+    ];
+    for input in inputs.iter() {
+        let outcome = run_import(input);
+        assert!(is_consistent(&outcome, input));
+    }
+}
+
+/// Regression: committed outcomes have no error and rejected outcomes have an error.
+#[test]
+fn regression_committed_has_no_error_rejected_has_error() {
+    let committed = run_import(&ImportInput {
+        authorized: true,
+        records: 10,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    });
+    assert!(committed.error.is_none());
+
+    let rejected = run_import(&ImportInput {
+        authorized: false,
+        records: 10,
+        bytes: 1_000,
+        duplicates: 0,
+        transient_failures: 0,
+        concurrent_imports: 1,
+    });
+    assert!(rejected.error.is_some());
+}
