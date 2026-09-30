@@ -5,6 +5,7 @@ mod testsuit {
     use crate::*;
     use crate::pause_functions;
     use proptest::prelude::*;
+    use remitwise_common;
     use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::{Address as AddressTrait, Ledger, LedgerInfo};
     use soroban_sdk::{Address, Env, IntoVal, String};
@@ -6504,5 +6505,192 @@ mod testsuit {
             }
         });
         assert!(fn_unpaused_found, "fn_unpaused event should be emitted");
+    }
+
+    #[test]
+    fn test_pause_function_admin_grant_expired() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        // Set initial time
+        let initial_time = 1_000_000;
+        set_ledger_time(&env, 1, initial_time);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Advance time beyond ADMIN_GRANT_TTL (30 days = 2_592_000 seconds)
+        let expired_time = initial_time + 2_592_001;
+        set_ledger_time(&env, 2, expired_time);
+
+        env.mock_all_auths();
+        // Attempt to pause function with expired admin grant
+        let result = client.try_pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert_eq!(result, Err(Ok(Error::AdminGrantExpired)));
+    }
+
+    #[test]
+    fn test_pause_function_kill_switch_active() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Activate kill switch
+        env.mock_all_auths();
+        remitwise_common::activate_kill_switch(&env, &admin);
+
+        // Attempt to pause function with kill switch active
+        env.mock_all_auths();
+        let result = client.try_pause_function(&admin, &pause_functions::CREATE_BILL);
+        // Kill switch causes panic_with_error, which manifests as a contract error
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pause_function_admin_grant_ttl_boundary() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        // Set initial time
+        let initial_time = 1_000_000;
+        set_ledger_time(&env, 1, initial_time);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Test at exact expiry boundary (just before expiry)
+        let just_before_expiry = initial_time + 2_591_999; // 30 days - 1 second
+        set_ledger_time(&env, 2, just_before_expiry);
+
+        env.mock_all_auths();
+        let result_before = client.try_pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(result_before.is_ok(), "Should succeed just before expiry");
+
+        // Test at exact expiry boundary (at expiry)
+        let at_expiry = initial_time + 2_592_000; // exactly 30 days
+        set_ledger_time(&env, 3, at_expiry);
+
+        env.mock_all_auths();
+        let result_at = client.try_pause_function(&admin, &pause_functions::PAY_BILL);
+        assert_eq!(result_at, Err(Ok(Error::AdminGrantExpired)), "Should fail at exact expiry");
+
+        // Test just after expiry
+        let just_after_expiry = initial_time + 2_592_001; // 30 days + 1 second
+        set_ledger_time(&env, 4, just_after_expiry);
+
+        env.mock_all_auths();
+        let result_after = client.try_pause_function(&admin, &pause_functions::CANCEL_BILL);
+        assert_eq!(result_after, Err(Ok(Error::AdminGrantExpired)), "Should fail just after expiry");
+    }
+
+    #[test]
+    fn test_pause_function_retry_safety() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // First pause attempt
+        env.mock_all_auths();
+        let result1 = client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(result1.is_ok());
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+
+        // Simulate retry (second attempt with same state)
+        env.mock_all_auths();
+        let result2 = client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(result2.is_ok());
+
+        // State should remain consistent
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+
+        // Verify no duplicate entries or corruption
+        let paused_map: soroban_sdk::Map<soroban_sdk::Symbol, bool> = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("PAUSED_FN"))
+            .unwrap();
+        assert_eq!(paused_map.len(), 1, "Should have exactly one paused function");
+    }
+
+    #[test]
+    fn test_pause_function_legacy_admin_grant_migration() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        // Set pause admin without grant timestamp (legacy state)
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Manually remove the grant timestamp to simulate legacy state
+        env.storage()
+            .instance()
+            .remove(&soroban_sdk::symbol_short!("PADM_GT"));
+
+        // Verify grant timestamp is not present
+        let grant_timestamp: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("PADM_GT"));
+        assert!(grant_timestamp.is_none(), "Grant timestamp should be absent in legacy state");
+
+        // Pause function should succeed and migrate the grant timestamp
+        env.mock_all_auths();
+        let result = client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(result.is_ok());
+
+        // Verify grant timestamp was set (migration occurred)
+        let grant_timestamp_after: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("PADM_GT"));
+        assert!(grant_timestamp_after.is_some(), "Grant timestamp should be set after migration");
+
+        // Function should be paused
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+    }
+
+    #[test]
+    fn test_pause_function_with_refreshed_grant() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        let initial_time = 1_000_000;
+        set_ledger_time(&env, 1, initial_time);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Advance time close to expiry
+        let near_expiry = initial_time + 2_000_000;
+        set_ledger_time(&env, 2, near_expiry);
+
+        // Refresh admin grant
+        env.mock_all_auths();
+        client.refresh_admin_grant(&admin);
+
+        // Advance time past original expiry but within refreshed window
+        let past_original_expiry = initial_time + 2_600_000;
+        set_ledger_time(&env, 3, past_original_expiry);
+
+        // Pause should succeed with refreshed grant
+        env.mock_all_auths();
+        let result = client.try_pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(result.is_ok(), "Should succeed with refreshed grant");
     }
 }
