@@ -198,6 +198,8 @@ Gets a page of ALL bills (paid + unpaid) for an owner that match a specific curr
 
 **Currency Comparison:** Case-insensitive (e.g., "usdc", "USDC", "UsDc" all match)
 
+**Requires:** `owner.require_auth()`
+
 #### `get_unpaid_bills_by_currency(env, owner, currency, cursor, limit) -> Page<Bill>`
 Gets a page of unpaid bills for an owner that match a specific currency.
 
@@ -210,6 +212,8 @@ Gets a page of unpaid bills for an owner that match a specific currency.
 **Returns:** Page struct with bills and next cursor
 
 **Currency Comparison:** Case-insensitive (e.g., "usdc", "USDC", "UsDc" all match)
+
+**Requires:** `owner.require_auth()`
 
 #### `get_total_unpaid_by_currency(env, owner, currency) -> i128`
 Calculates total amount of unpaid bills for an owner in a specific currency.
@@ -230,6 +234,8 @@ Gets a paginated list of overdue unpaid bills across all owners.
 - `limit`: Maximum number of bills to return (1-100, defaults to 10)
 
 **Returns:** Page struct with bills and next cursor
+
+**Ergonomic access:** `BillPage::first()` returns `Result<Bill, BillPaymentsError>` so callers can handle empty pages without `unwrap()`-based workarounds. Empty pages return `BillPaymentsError::EmptyPage`.
 
 #### `get_total_unpaid(env, owner) -> i128`
 Calculates total amount of unpaid bills for an owner.

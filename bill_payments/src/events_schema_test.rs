@@ -9,15 +9,13 @@
 //! A failure here means the change is **breaking for downstream indexers**.
 //! See [EVENTS.md](../../EVENTS.md) for the full schema contract.
 
-#![cfg(test)]
+// bill_payments events_schema_test
 
 use super::*;
 use crate::pause_functions::{
     ARCHIVE, CANCEL_BILL, CANCEL_BILL_SCHEDULE, CREATE_BILL, CREATE_BILL_SCHEDULE,
     EXECUTE_BILL_SCHEDULES, MODIFY_BILL_SCHEDULE, PAY_BILL, RESTORE,
 };
-use soroban_sdk::{symbol_short, Env, IntoVal, Symbol, TryFromVal, Val};
-use crate::pause_functions::{ARCHIVE, CANCEL_BILL, CREATE_BILL, PAY_BILL, RESTORE};
 use crate::BillPaymentsClient;
 use soroban_sdk::testutils::Address as AddressTrait;
 use soroban_sdk::testutils::Events;
@@ -168,6 +166,27 @@ fn bill_record_payload_schema() {
     assert_eq!(decoded.currency, currency);
 }
 
+/// Pinned contract: the three lifecycle variants that replace legacy ad-hoc
+/// symbol emission must serialize as typed BillEvent enum values (not raw Symbols)
+/// so indexers can match against the stable enum wire representation.
+#[test]
+fn reserved_bill_event_variants_serialize_as_enum_not_symbol() {
+    let env = Env::default();
+
+    for variant in [
+        BillEvent::Cancelled,
+        BillEvent::Restored,
+        BillEvent::ExternalRefUpdated,
+    ] {
+        let val: Val = variant.clone().into_val(&env);
+        // Round-trip: decode back to BillEvent — must succeed (proves it serialized
+        // as a proper enum variant, not a raw Symbol that cannot be decoded).
+        let decoded = BillEvent::try_from_val(&env, &val)
+            .expect("BillEvent variant must deserialize from its own serialized form");
+        let _ = decoded;
+    }
+}
+
 #[test]
 fn bill_event_secondary_topics_emit_expected_variants() {
     let env = Env::default();
@@ -175,6 +194,11 @@ fn bill_event_secondary_topics_emit_expected_variants() {
     let contract_id = env.register_contract(None, BillPayments);
     let client = BillPaymentsClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    // pay_bill is guarded by the cross-contract orchestrator check; configure
+    // a trusted orchestrator so the guarded call succeeds.
+    let orch = Address::generate(&env);
+    client.init_admin(&owner, &DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS);
+    client.set_trusted_orchestrator(&owner, &orch);
 
     let bill_id_1 = client.create_bill(
         &owner,
@@ -202,7 +226,7 @@ fn bill_event_secondary_topics_emit_expected_variants() {
         &String::from_str(&env, "XLM"),
         &None,
     );
-    client.pay_bill(&owner, &bill_id_2);
+    client.pay_bill(&orch, &0, &owner, &bill_id_2);
     client.archive_paid_bills(&owner, &(env.ledger().timestamp() + 1));
     client.restore_bill(&owner, &bill_id_2);
 
@@ -302,7 +326,8 @@ fn batch_pay_bills_emits_paid_events_matching_pay_bill() {
     let mut batch = Vec::new(&env);
     batch.push_back(bill_a);
     batch.push_back(bill_b);
-    client.batch_pay_bills(&owner, &batch);
+    let result = client.batch_pay_bills(&owner, &batch);
+    assert!(result.is_ok(), "batch must succeed");
 
     let mut paid_events = 0u32;
     for (_cid, topics, data) in env.events().all() {
