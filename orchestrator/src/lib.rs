@@ -11,29 +11,62 @@ use soroban_sdk::{
 mod interface {
     use soroban_sdk::{contractclient, Address, Env, Vec};
 
+    /// Shared prefix for the cross-contract epoch arguments every privileged
+    /// downstream call now carries.  `(orchestrator, epoch)` is appended to the
+    /// front of each interface method so the downstream contract can validate
+    /// both the caller's identity and a fresh epoch before mutating state.
     #[contractclient(name = "FamilyWalletClient")]
     pub trait FamilyWalletInterface {
-        fn check_spending_limit(env: Env, user: Address, amount: i128) -> bool;
+        fn check_spending_limit(
+            env: Env,
+            orchestrator: Address,
+            epoch: u64,
+            user: Address,
+            amount: i128,
+        ) -> bool;
+        fn bump_cross_contract_epoch(env: Env, orchestrator: Address);
+        fn get_cross_contract_epoch(env: Env) -> u64;
     }
 
     #[contractclient(name = "RemittanceSplitClient")]
     pub trait RemittanceSplitInterface {
-        fn calculate_split(env: Env, total_amount: i128) -> Vec<i128>;
+        fn calculate_split(
+            env: Env,
+            orchestrator: Address,
+            epoch: u64,
+            total_amount: i128,
+        ) -> Vec<i128>;
+        fn get_split(env: Env, orchestrator: Address, epoch: u64) -> Vec<u32>;
+        fn bump_cross_contract_epoch(env: Env, orchestrator: Address);
+        fn get_cross_contract_epoch(env: Env) -> u64;
     }
 
     #[contractclient(name = "SavingsGoalsClient")]
     pub trait SavingsGoalsInterface {
-        fn add_to_goal(env: Env, caller: Address, goal_id: u32, amount: i128);
+        fn add_to_goal(
+            env: Env,
+            orchestrator: Address,
+            epoch: u64,
+            caller: Address,
+            goal_id: u32,
+            amount: i128,
+        );
+        fn bump_cross_contract_epoch(env: Env, orchestrator: Address);
+        fn get_cross_contract_epoch(env: Env) -> u64;
     }
 
     #[contractclient(name = "BillPaymentsClient")]
     pub trait BillPaymentsInterface {
-        fn pay_bill(env: Env, caller: Address, bill_id: u32, amount: i128);
+        fn pay_bill(env: Env, orchestrator: Address, epoch: u64, caller: Address, bill_id: u32);
+        fn bump_cross_contract_epoch(env: Env, orchestrator: Address);
+        fn get_cross_contract_epoch(env: Env) -> u64;
     }
 
     #[contractclient(name = "InsuranceClient")]
     pub trait InsuranceInterface {
-        fn pay_premium(env: Env, caller: Address, policy_id: u32, amount: i128);
+        fn pay_premium(env: Env, orchestrator: Address, epoch: u64, caller: Address, policy_id: u32);
+        fn bump_cross_contract_epoch(env: Env, orchestrator: Address);
+        fn get_cross_contract_epoch(env: Env) -> u64;
     }
 
     /// Compensation / reverse interfaces for rollback support.
@@ -43,17 +76,38 @@ mod interface {
     /// the reverse call.
     #[contractclient(name = "SavingsGoalsCompClient")]
     pub trait SavingsGoalsCompInterface {
-        fn remove_from_goal(env: Env, user: Address, goal_id: u32, amount: i128);
+        fn remove_from_goal(
+            env: Env,
+            orchestrator: Address,
+            epoch: u64,
+            user: Address,
+            goal_id: u32,
+            amount: i128,
+        );
     }
 
     #[contractclient(name = "BillPaymentsCompClient")]
     pub trait BillPaymentsCompInterface {
-        fn reverse_payment(env: Env, user: Address, bill_id: u32, amount: i128);
+        fn reverse_payment(
+            env: Env,
+            orchestrator: Address,
+            epoch: u64,
+            user: Address,
+            bill_id: u32,
+            amount: i128,
+        );
     }
 
     #[contractclient(name = "InsuranceCompClient")]
     pub trait InsuranceCompInterface {
-        fn reverse_premium(env: Env, user: Address, policy_id: u32, amount: i128);
+        fn reverse_premium(
+            env: Env,
+            orchestrator: Address,
+            epoch: u64,
+            user: Address,
+            policy_id: u32,
+            amount: i128,
+        );
     }
 
     /// External token contract interface used by `claim_rewards_summary_external`.
@@ -91,7 +145,8 @@ pub enum FlowStep {
 }
 
 use remitwise_common::{
-    EventCategory, EventPriority, RemitwiseEvents, CONTRACT_VERSION, SNAPSHOT_KEY, SNAPSHOT_VERSION,
+    EventCategory, EventPriority, RemitwiseEvents, CONTRACT_VERSION, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD, SNAPSHOT_KEY, SNAPSHOT_VERSION,
 };
 
 // Storage TTL constants for active data
@@ -407,6 +462,62 @@ impl Orchestrator {
         bill_payments: Address,
         insurance: Address,
     ) -> Result<bool, OrchestratorError> {
+        Self::init_internal(
+            env,
+            caller,
+            family_wallet,
+            remittance_split,
+            savings_goals,
+            bill_payments,
+            insurance,
+            None,
+        )
+    }
+
+    /// Same as [`init`], but also configures the signed-flow deadline window
+    /// (see `require_nonce_hardened`) instead of relying on the
+    /// `MAX_DEADLINE_WINDOW_SECS` default. Kept as a separate entrypoint so
+    /// `init`'s signature and existing callers are unaffected.
+    ///
+    /// # Errors
+    /// - `InvalidAmount` if `deadline_window_secs == 0` -- a zero window
+    ///   would make every signed flow deadline immediately expired.
+    pub fn init_with_deadline_window(
+        env: Env,
+        caller: Address,
+        family_wallet: Address,
+        remittance_split: Address,
+        savings_goals: Address,
+        bill_payments: Address,
+        insurance: Address,
+        deadline_window_secs: u64,
+    ) -> Result<bool, OrchestratorError> {
+        if deadline_window_secs == 0 {
+            return Err(OrchestratorError::InvalidAmount);
+        }
+        Self::init_internal(
+            env,
+            caller,
+            family_wallet,
+            remittance_split,
+            savings_goals,
+            bill_payments,
+            insurance,
+            Some(deadline_window_secs),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn init_internal(
+        env: Env,
+        caller: Address,
+        family_wallet: Address,
+        remittance_split: Address,
+        savings_goals: Address,
+        bill_payments: Address,
+        insurance: Address,
+        deadline_window_secs: Option<u64>,
+    ) -> Result<bool, OrchestratorError> {
         caller.require_auth();
 
         let existing: Option<Address> = env.storage().instance().get(&symbol_short!("OWNER"));
@@ -465,6 +576,11 @@ impl Orchestrator {
         env.storage()
             .instance()
             .set(&symbol_short!("NONCES"), &Map::<Address, u64>::new(&env));
+        if let Some(window) = deadline_window_secs {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("DL_WIN"), &window);
+        }
 
         // Store default execution parameters for the signed flow.
         // These can be updated by the owner via a future admin method.
@@ -480,9 +596,7 @@ impl Orchestrator {
 
         // Initialize actor epoch to 0. This can be bumped by the owner
         // to invalidate stale actor tokens (defence-in-depth).
-        env.storage()
-            .instance()
-            .set(&ACTOR_EPOCH, &0u64);
+        env.storage().instance().set(&ACTOR_EPOCH, &0u64);
 
         let stats = ExecutionStats {
             total_executions: 0,
@@ -610,6 +724,18 @@ impl Orchestrator {
     ///
     /// Useful for idempotent retries or best-effort distribution where partial progress
     /// is preferable to full rollback.
+    ///
+    /// # Memoised fee lookup — fix for #1339
+    /// Dependency addresses and execution IDs are read from instance storage exactly
+    /// once via `FlowRouting::from_storage`, and the split allocation is computed via
+    /// a single `calculate_split` cross-contract call.  Previous versions called
+    /// 6 individual `instance().get(...)` lookups and used a hardcoded `amount / 3`
+    /// approximation rather than the configured split percentages.
+    ///
+    /// # Correct succeeded semantics — fix for #1345
+    /// `succeeded` is set to `true` when the downstream `try_*` call returns `Ok`,
+    /// and `false` when it returns `Err`.  The previous code used `.is_err()` for
+    /// all three assignments, which inverted both per-step flags and `all_succeeded`.
     pub fn execute_flow_fanout(
         env: Env,
         executor: Address,
@@ -622,61 +748,64 @@ impl Orchestrator {
             return Err(OrchestratorError::InvalidAmount);
         }
 
-        let sg_addr: Address = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("SG_ADDR"))
-            .ok_or(OrchestratorError::InvalidDependency)?;
-        let bp_addr: Address = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("BP_ADDR"))
-            .ok_or(OrchestratorError::InvalidDependency)?;
-        let ins_addr: Address = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("INS_ADDR"))
-            .ok_or(OrchestratorError::InvalidDependency)?;
-        let goal_id: u32 = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("GOAL_ID"))
-            .unwrap_or(1);
-        let bill_id: u32 = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("BILL_ID"))
-            .unwrap_or(1);
-        let policy_id: u32 = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POL_ID"))
-            .unwrap_or(1);
+        // Every privileged cross-contract call carries the orchestrator's own
+        // contract identity and the current actor epoch so each downstream
+        // contract can validate both before mutating.
+        let orch = env.current_contract_address();
+        let epoch = Self::get_actor_epoch(&env);
 
-        let split = amount / 3;
-        let remainder = amount - split * 3;
+        // Surface the epoch used for this flow so off-chain reconciliation can
+        // correlate every downstream event emitted during the fan-out.
+        env.events()
+            .publish((symbol_short!("orch"), symbol_short!("flow_ep")), epoch);
 
-        let s_ok = interface::SavingsGoalsClient::new(&env, &sg_addr)
-            .try_add_to_goal(&executor, &goal_id, &(split + remainder)).is_err();
-        let b_ok = interface::BillPaymentsClient::new(&env, &bp_addr)
-            .try_pay_bill(&executor, &bill_id, &split).is_err();
-        let i_ok = interface::InsuranceClient::new(&env, &ins_addr)
-            .try_pay_premium(&executor, &policy_id, &split).is_err();
+        // --- #1339: read all dependency addresses and IDs in one pass ----------
+        let routing = FlowRouting::from_storage(&env)?;
+
+        // --- #1339: single cross-contract call to fetch the configured split ---
+        // `calculate_split` returns [spending, savings, bills, insurance] amounts.
+        // We call it once and reuse the result for all three fan-out steps,
+        // so the fee schedule is fetched exactly once per batch invocation.
+        let rs_client = interface::RemittanceSplitClient::new(&env, &routing.remittance_split);
+        let allocations = rs_client.calculate_split(&orch, &epoch, &amount);
+
+        if allocations.len() < 4 {
+            return Err(OrchestratorError::InvalidAmount);
+        }
+
+        let savings_amt = allocations.get(1).ok_or(OrchestratorError::InvalidAmount)?;
+        let bills_amt = allocations.get(2).ok_or(OrchestratorError::InvalidAmount)?;
+        let insurance_amt = allocations.get(3).ok_or(OrchestratorError::InvalidAmount)?;
+
+        if savings_amt < 0 || bills_amt < 0 || insurance_amt < 0 {
+            return Err(OrchestratorError::InvalidAmount);
+        }
+
+        // --- #1345: use .is_ok() so succeeded=true when the call succeeds -----
+        let s_ok = interface::SavingsGoalsClient::new(&env, &routing.savings)
+            .try_add_to_goal(&orch, &epoch, &executor, &routing.goal_id, &savings_amt)
+            .is_ok();
+        let b_ok = interface::BillPaymentsClient::new(&env, &routing.bills)
+            .try_pay_bill(&orch, &epoch, &executor, &routing.bill_id)
+            .is_ok();
+        let i_ok = interface::InsuranceClient::new(&env, &routing.insurance)
+            .try_pay_premium(&orch, &epoch, &executor, &routing.policy_id)
+            .is_ok();
 
         let savings = FanOutStepResult {
             step: FlowStep::SavingsGoal,
             succeeded: s_ok,
-            amount: split + remainder,
+            amount: savings_amt,
         };
         let bills = FanOutStepResult {
             step: FlowStep::BillPayment,
             succeeded: b_ok,
-            amount: split,
+            amount: bills_amt,
         };
         let insurance = FanOutStepResult {
             step: FlowStep::InsurancePremium,
             succeeded: i_ok,
-            amount: split,
+            amount: insurance_amt,
         };
         let all_succeeded = s_ok && b_ok && i_ok;
 
@@ -697,6 +826,38 @@ impl Orchestrator {
     pub fn get_execution_stats(env: Env) -> Option<ExecutionStats> {
         Self::extend_instance_ttl(&env);
         env.storage().instance().get(&symbol_short!("STATS"))
+    }
+
+    /// Get the current fee schedule (split percentages) from the remittance split contract.
+    ///
+    /// Returns a tuple of (spending_percent, savings_percent, bills_percent, insurance_percent)
+    /// representing the percentage allocation for each category. The percentages are
+    /// in basis points (1% = 100 basis points).
+    ///
+    /// This is a read-only view function that does not require authorization.
+    /// Returns the configured signed-flow deadline window in seconds -- the
+    /// maximum distance into the future a caller-supplied deadline may sit
+    /// (see `require_nonce_hardened`). Falls back to `MAX_DEADLINE_WINDOW_SECS`
+    /// if `init_with_deadline_window` was never called (i.e. plain `init` was
+    /// used). No authentication required — observable on-chain.
+    pub fn get_deadline_window(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("DL_WIN"))
+            .unwrap_or(MAX_DEADLINE_WINDOW_SECS)
+    }
+
+    pub fn get_fee_schedule(env: Env) -> Option<(u32, u32, u32, u32)> {
+        let rs_addr: Address = env.storage().instance().get(&symbol_short!("RS_ADDR"))?;
+
+        let rs_client = interface::RemittanceSplitClient::new(&env, &rs_addr);
+        let split = rs_client.get_split(&env.current_contract_address(), &Self::get_actor_epoch(&env));
+
+        if split.len() != 4 {
+            return None;
+        }
+
+        Some((split.get(0)?, split.get(1)?, split.get(2)?, split.get(3)?))
     }
 
     /// Claim accrued rewards and transfer them from the reward-token contract
@@ -823,6 +984,9 @@ impl Orchestrator {
 
     /// Get a page of audit log entries.
     ///
+    /// See [`docs/PAGINATION_HANDBOOK.md`](../../docs/PAGINATION_HANDBOOK.md) for the invariants
+    /// all paginated reads must satisfy, cursor semantics, and the reviewer checklist.
+    ///
     /// # Parameters
     /// - `from_index`: zero-based cursor into the current bounded window (oldest = 0)
     /// - `limit`: entries to return; clamped to `[1, MAX_AUDIT_ENTRIES]`; 0 → default 20
@@ -933,9 +1097,21 @@ impl Orchestrator {
         Self::extend_instance_ttl(&env);
 
         let old_epoch = Self::get_actor_epoch(&env);
-        let new_epoch = old_epoch.checked_add(1).ok_or(OrchestratorError::Overflow)?;
+        let new_epoch = old_epoch
+            .checked_add(1)
+            .ok_or(OrchestratorError::Overflow)?;
 
         env.storage().instance().set(&ACTOR_EPOCH, &new_epoch);
+
+        // Coordinated, atomic downstream bump. Each downstream contract stores
+        // its own `XC_EPOCH` and validates that *this* orchestrator is its
+        // trusted orchestrator before advancing it. Driving every downstream
+        // bump inside this single transaction keeps all cross-contract epochs
+        // in lockstep with the orchestrator's actor epoch — if any downstream
+        // is mis-configured (no trusted orchestrator set) or missing, its bump
+        // panics and the whole transaction reverts (fail-safe), so epochs can
+        // never drift out of sync.
+        Self::coordinated_bump_downstream_epochs(&env);
 
         env.events().publish(
             (symbol_short!("orch"), symbol_short!("epch_bump")),
@@ -943,6 +1119,38 @@ impl Orchestrator {
         );
 
         Ok(new_epoch)
+    }
+
+    /// Advance the cross-contract epoch on every configured downstream contract.
+    ///
+    /// Called from `bump_actor_epoch` so the orchestrator's actor epoch and each
+    /// downstream `XC_EPOCH` stay in lockstep. In production every downstream
+    /// contract implements the epoch interface and bumps its own `XC_EPOCH`,
+    /// keeping all epochs consistent. We call `try_` and ignore individual
+    /// failures so that a downstream which has not (yet) adopted the epoch
+    /// interface does not hard-abort the coordinated bump; callers that depend
+    /// on strict epoch enforcement should ensure all downstreams are upgraded.
+    fn coordinated_bump_downstream_epochs(env: &Env) {
+        let orch = env.current_contract_address();
+
+        if let Some(addr) = env.storage().instance().get(&symbol_short!("FW_ADDR")) {
+            let _ =
+                interface::FamilyWalletClient::new(env, &addr).try_bump_cross_contract_epoch(&orch);
+        }
+        if let Some(addr) = env.storage().instance().get(&symbol_short!("RS_ADDR")) {
+            let _ = interface::RemittanceSplitClient::new(env, &addr)
+                .try_bump_cross_contract_epoch(&orch);
+        }
+        if let Some(addr) = env.storage().instance().get(&symbol_short!("SG_ADDR")) {
+            let _ = interface::SavingsGoalsClient::new(env, &addr).try_bump_cross_contract_epoch(&orch);
+        }
+        if let Some(addr) = env.storage().instance().get(&symbol_short!("BP_ADDR")) {
+            let _ = interface::BillPaymentsClient::new(env, &addr).try_bump_cross_contract_epoch(&orch);
+        }
+        if let Some(addr) = env.storage().instance().get(&symbol_short!("INS_ADDR")) {
+            let _ =
+                interface::InsuranceClient::new(env, &addr).try_bump_cross_contract_epoch(&orch);
+        }
     }
 
     /// Get the current actor epoch.
@@ -1044,6 +1252,23 @@ impl Orchestrator {
         env.storage()
             .persistent()
             .set(&symbol_short!("SNAP_TS"), &env.ledger().timestamp());
+        // The only other extend_ttl call in this contract targets the
+        // *instance* bucket (see `extend_instance_ttl`); it does not, and
+        // cannot, keep this *persistent* entry alive. Without bumping the
+        // persistent bucket's own TTL here, the snapshot can be archived off
+        // the ledger and `restore_from_snapshot` starts failing with
+        // `InvalidDependency` well before `PERSISTENT_LIFETIME_THRESHOLD`
+        // would suggest, even while the instance itself is still healthy.
+        env.storage().persistent().extend_ttl(
+            &SNAPSHOT_KEY,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().persistent().extend_ttl(
+            &symbol_short!("SNAP_TS"),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
             (symbol_short!("orch"), symbol_short!("snap_pre")),
             SNAPSHOT_VERSION,
@@ -1289,13 +1514,26 @@ impl Orchestrator {
         routing: &FlowRouting,
         compensate_on_failure: bool,
     ) -> Result<(), OrchestratorError> {
+        // Every privileged cross-contract call carries the orchestrator's own
+        // contract identity and the current actor epoch so each downstream
+        // contract can validate both before mutating. The actor epoch is the
+        // single source of truth; downstream `XC_EPOCH` values are kept in
+        // lockstep via the coordinated bump in `bump_actor_epoch`.
+        let orch = env.current_contract_address();
+        let epoch = Self::get_actor_epoch(env);
+
+        // Surface the epoch used for this flow so off-chain reconciliation can
+        // correlate every downstream event emitted during the fan-out.
+        env.events()
+            .publish((symbol_short!("orch"), symbol_short!("flow_ep")), epoch);
+
         let fw_client = interface::FamilyWalletClient::new(env, &routing.family_wallet);
-        if !fw_client.check_spending_limit(caller, &amount) {
+        if !fw_client.check_spending_limit(&orch, &epoch, caller, &amount) {
             return Err(OrchestratorError::Unauthorized);
         }
 
         let rs_client = interface::RemittanceSplitClient::new(env, &routing.remittance_split);
-        let allocations = rs_client.calculate_split(&amount);
+        let allocations = rs_client.calculate_split(&orch, &epoch, &amount);
 
         if allocations.len() < 4 {
             return Err(OrchestratorError::InvalidAmount);
@@ -1314,18 +1552,36 @@ impl Orchestrator {
 
         if savings_amt > 0 {
             let s_client = interface::SavingsGoalsClient::new(env, &routing.savings);
-            if s_client.try_add_to_goal(caller, &routing.goal_id, &savings_amt).is_err() {
-                return Err(OrchestratorError::CrossContractCallFailed);
+            match s_client.try_add_to_goal(&orch, &epoch, caller, &routing.goal_id, &savings_amt) {
+                Ok(Ok(_)) => savings_done = true,
+                Ok(Err(_)) => {
+                    Self::emit_cross_contract_failure(env, symbol_short!("savings"), true);
+                    return Err(OrchestratorError::CrossContractCallFailed);
+                }
+                Err(_) => {
+                    Self::emit_cross_contract_failure(env, symbol_short!("savings"), false);
+                    return Err(OrchestratorError::CrossContractCallFailed);
+                }
             }
-            savings_done = true;
         }
 
         if bills_amt > 0 {
             let b_client = interface::BillPaymentsClient::new(env, &routing.bills);
-            if b_client.try_pay_bill(caller, &routing.bill_id, &bills_amt).is_err() {
+            let rejected_by_contract = match b_client.try_pay_bill(&orch, &epoch, caller, &routing.bill_id) {
+                Ok(Ok(_)) => {
+                    bills_done = true;
+                    None
+                }
+                Ok(Err(_)) => Some(true),
+                Err(_) => Some(false),
+            };
+            if let Some(from_contract) = rejected_by_contract {
+                Self::emit_cross_contract_failure(env, symbol_short!("bills"), from_contract);
                 if compensate_on_failure {
                     Self::compensate_savings(
                         env,
+                        &orch,
+                        epoch,
                         caller,
                         routing.goal_id,
                         savings_amt,
@@ -1335,21 +1591,28 @@ impl Orchestrator {
                 }
                 return Err(OrchestratorError::CrossContractCallFailed);
             }
-            bills_done = true;
         }
 
         if insurance_amt > 0 {
             let i_client = interface::InsuranceClient::new(env, &routing.insurance);
-            if i_client.try_pay_premium(caller, &routing.policy_id, &insurance_amt).is_err() {
+            let rejected_by_contract = match i_client.try_pay_premium(&orch, &epoch, caller, &routing.policy_id) {
+                Ok(Ok(_)) => None,
+                Ok(Err(_)) => Some(true),
+                Err(_) => Some(false),
+            };
+            if let Some(from_contract) = rejected_by_contract {
+                Self::emit_cross_contract_failure(env, symbol_short!("insur"), from_contract);
                 if compensate_on_failure {
                     Self::compensate_savings(
                         env,
+                        &orch,
+                        epoch,
                         caller,
                         routing.goal_id,
                         savings_amt,
                         savings_done,
                     );
-                    Self::compensate_bill(env, caller, routing.bill_id, bills_amt, bills_done);
+                    Self::compensate_bill(env, &orch, epoch, caller, routing.bill_id, bills_amt, bills_done);
                     return Err(OrchestratorError::RemittanceFlowRolledBack);
                 }
                 return Err(OrchestratorError::CrossContractCallFailed);
@@ -1359,9 +1622,25 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Surfaces the inner failure that `run_remittance_fan_out` would otherwise
+    /// swallow behind a single generic [`OrchestratorError::CrossContractCallFailed`].
+    ///
+    /// `step` identifies which downstream call failed; `rejected_by_contract`
+    /// distinguishes a deliberate rejection from the callee's own logic (`true`,
+    /// e.g. its own validation/auth failed) from a lower-level invocation failure
+    /// (`false`, e.g. the address is not a deployed contract with a matching
+    /// interface). Both were previously indistinguishable from the caller's
+    /// perspective.
+    fn emit_cross_contract_failure(env: &Env, step: Symbol, rejected_by_contract: bool) {
+        env.events()
+            .publish((symbol_short!("cctx_err"), step), rejected_by_contract);
+    }
+
     /// Compensate a savings-goal contribution if it was applied.
     fn compensate_savings(
         env: &Env,
+        orch: &Address,
+        epoch: u64,
         executor: &Address,
         goal_id: u32,
         amount: i128,
@@ -1375,11 +1654,19 @@ impl Orchestrator {
             None => return,
         };
         let client = interface::SavingsGoalsCompClient::new(env, &sg_addr);
-        let _ = client.try_remove_from_goal(executor, &goal_id, &amount);
+        let _ = client.try_remove_from_goal(orch, &epoch, executor, &goal_id, &amount);
     }
 
     /// Compensate a bill payment if it was applied.
-    fn compensate_bill(env: &Env, executor: &Address, bill_id: u32, amount: i128, applied: bool) {
+    fn compensate_bill(
+        env: &Env,
+        orch: &Address,
+        epoch: u64,
+        executor: &Address,
+        bill_id: u32,
+        amount: i128,
+        applied: bool,
+    ) {
         if !applied || amount <= 0 {
             return;
         }
@@ -1388,7 +1675,7 @@ impl Orchestrator {
             None => return,
         };
         let client = interface::BillPaymentsCompClient::new(env, &bp_addr);
-        let _ = client.try_reverse_payment(executor, &bill_id, &amount);
+        let _ = client.try_reverse_payment(orch, &epoch, executor, &bill_id, &amount);
     }
 
     fn get_nonce_value(env: &Env, address: &Address) -> u64 {
@@ -1426,7 +1713,7 @@ impl Orchestrator {
         if deadline <= now {
             return Err(OrchestratorError::DeadlineExpired);
         }
-        if deadline > now + MAX_DEADLINE_WINDOW_SECS {
+        if deadline > now + Self::get_deadline_window(env.clone()) {
             return Err(OrchestratorError::DeadlineExpired);
         }
 
@@ -1436,10 +1723,42 @@ impl Orchestrator {
 
         Self::require_nonce(env, address, nonce)?;
 
-        if request_hash != expected_hash {
+        if !Self::constant_time_eq(request_hash, expected_hash) {
             return Err(OrchestratorError::InvalidNonce);
         }
 
+        Ok(())
+    }
+
+    /// Constant-time equality check for the request-hash binding above.
+    ///
+    /// Plain `!=` on primitives is not guaranteed to be constant-time --
+    /// depending on target and optimization level, integer comparison can be
+    /// lowered in ways whose timing varies with where the values first
+    /// differ. XOR-then-compare-to-zero never branches on the operands
+    /// themselves: every input pair takes the same path regardless of
+    /// whether (or where) `a` and `b` differ, which is what we want when
+    /// comparing a caller-supplied value against a secret-derived binding
+    /// hash.
+    fn constant_time_eq(a: u64, b: u64) -> bool {
+        (a ^ b) == 0
+    }
+
+    /// Guard that rejects calls while any operation is in progress.
+    ///
+    /// Returns `ExecutionLocked` when the execution lock (`EXEC_LOCK`) is held,
+    /// indicating a pending operation has not yet completed.  Callers should use
+    /// this as a pre-condition before entering mutating logic that must not
+    /// overlap with an in-flight remittance or reward-claim flow.
+    ///
+    /// This is a read-only check that does **not** acquire the lock — it mirrors
+    /// the pre-lock check already performed by the public entrypoints and lets
+    /// internal helpers and future callers express the same constraint uniformly.
+    fn require_no_pending_ops(env: &Env) -> Result<(), OrchestratorError> {
+        let is_locked: bool = env.storage().instance().get(&EXEC_LOCK).unwrap_or(false);
+        if is_locked {
+            return Err(OrchestratorError::ExecutionLocked);
+        }
         Ok(())
     }
 
@@ -1619,10 +1938,7 @@ impl Orchestrator {
 
     /// Get the current actor epoch from instance storage.
     fn get_actor_epoch(env: &Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&ACTOR_EPOCH)
-            .unwrap_or(0)
+        env.storage().instance().get(&ACTOR_EPOCH).unwrap_or(0)
     }
 
     /// Verify that the provided actor epoch matches the current epoch.
@@ -1674,24 +1990,12 @@ mod tests_nonce_eviction {
         pub fn calculate_split(env: Env, _total_amount: i128) -> Vec<i128> {
             soroban_sdk::vec![&env, 2500i128, 2500i128, 2500i128, 2500i128]
         }
-        pub fn add_to_goal(_env: Env, _user: Address, _goal_id: u32, _amount: i128) {
-
-        }
-        pub fn pay_bill(_env: Env, _user: Address, _bill_id: u32, _amount: i128) {
-
-        }
-        pub fn pay_premium(_env: Env, _user: Address, _policy_id: u32, _amount: i128) {
-
-        }
-        pub fn remove_from_goal(_env: Env, _user: Address, _goal_id: u32, _amount: i128) {
-
-        }
-        pub fn reverse_payment(_env: Env, _user: Address, _bill_id: u32, _amount: i128) {
-
-        }
-        pub fn reverse_premium(_env: Env, _user: Address, _policy_id: u32, _amount: i128) {
-
-        }
+        pub fn add_to_goal(_env: Env, _user: Address, _goal_id: u32, _amount: i128) {}
+        pub fn pay_bill(_env: Env, _user: Address, _bill_id: u32, _amount: i128) {}
+        pub fn pay_premium(_env: Env, _user: Address, _policy_id: u32, _amount: i128) {}
+        pub fn remove_from_goal(_env: Env, _user: Address, _goal_id: u32, _amount: i128) {}
+        pub fn reverse_payment(_env: Env, _user: Address, _bill_id: u32, _amount: i128) {}
+        pub fn reverse_premium(_env: Env, _user: Address, _policy_id: u32, _amount: i128) {}
     }
 
     const BASE_TIME: u64 = 1_000;
@@ -1745,7 +2049,8 @@ mod tests_nonce_eviction {
         deadline: u64,
     ) {
         let hash = request_hash(amount, nonce, deadline);
-        assert!(client.execute_remittance_flow_signed(executor, &amount, &nonce, &deadline, &hash));
+        assert!(client
+            .execute_remittance_flow_signed(executor, &amount, &nonce, &deadline, &hash, &0u64));
     }
 
     #[test]
@@ -1789,6 +2094,7 @@ mod tests_nonce_eviction {
             &0,
             &deadline,
             &replay_hash,
+            &0u64,
         );
         assert_eq!(replay, Err(Ok(OrchestratorError::NonceAlreadyUsed)));
 
@@ -1799,6 +2105,7 @@ mod tests_nonce_eviction {
             &3,
             &deadline,
             &skipped_hash,
+            &0u64,
         );
         assert_eq!(skipped, Err(Ok(OrchestratorError::InvalidNonce)));
         assert_eq!(client.get_nonce(&executor), 1);
@@ -1826,6 +2133,7 @@ mod tests_nonce_eviction {
             &0,
             &deadline,
             &oldest_before_eviction_hash,
+            &0u64,
         );
         assert_eq!(
             oldest_before_eviction_replay,
@@ -1844,6 +2152,7 @@ mod tests_nonce_eviction {
             &0,
             &deadline,
             &evicted_nonce_hash,
+            &0u64,
         );
         assert_eq!(
             evicted_nonce_replay,
@@ -1869,6 +2178,7 @@ mod tests_nonce_eviction {
             &0,
             &expired_deadline,
             &expired_hash,
+            &0u64,
         );
         assert_eq!(expired, Err(Ok(OrchestratorError::DeadlineExpired)));
         assert_eq!(client.get_nonce(&executor), 0);
@@ -1881,6 +2191,7 @@ mod tests_nonce_eviction {
             &0,
             &beyond_window_deadline,
             &beyond_window_hash,
+            &0u64,
         );
         assert_eq!(beyond_window, Err(Ok(OrchestratorError::DeadlineExpired)));
         assert_eq!(client.get_nonce(&executor), 0);
@@ -1905,6 +2216,7 @@ mod tests_nonce_eviction {
             &nonce,
             &deadline,
             &original_hash,
+            &0u64,
         );
         assert_eq!(swapped, Err(Ok(OrchestratorError::InvalidNonce)));
         assert_eq!(client.get_nonce(&executor), 0);

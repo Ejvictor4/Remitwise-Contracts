@@ -275,6 +275,10 @@ pub struct GoalCreatedEvent {
 
 **Topic:** `"added"` (primary)  
 **Secondary Topic:** `("savings", SavingsEvent::FundsAdded)`
+**Emitted by:** `add_to_goal`, `batch_add_to_goals`, `execute_due_savings_schedules` — all three
+paths publish the identical `FundsAddedEvent` shape (including `new_total` and `timestamp`) via
+`RemitwiseEvents::emit`, so indexers see one consistent payload regardless of whether a credit came
+from a manual contribution or a scheduled execution.
 
 **Data Structure:**
 
@@ -304,6 +308,10 @@ pub struct FundsAddedEvent {
 
 **Topic:** `"completed"` (primary)  
  **Secondary Topic:** `("savings", SavingsEvent::GoalCompleted)`
+**Emitted by:** `add_to_goal`, `batch_add_to_goals`, `execute_due_savings_schedules` — exactly once
+per goal, on whichever credit (manual or scheduled) first brings `current_amount >= target_amount`.
+A goal that is already completed before a credit lands must not re-emit this event regardless of
+which path applies the credit.
 
 **Data Structure:**
 
@@ -385,12 +393,14 @@ pub struct FundsWithdrawnEvent {
 ### Event: Goal Locked/Unlocked
 
 **Topic:** `("savings", SavingsEvent::GoalLocked)` or `("savings", SavingsEvent::GoalUnlocked)`
+**Emitted by:** `lock_goal` (`locked: true`), `unlock_goal` (`locked: false`)
 
 **Data Structure:**
 
 ```rust
 pub struct GoalLockEvent {
     pub goal_id: u32,               // Goal ID
+    pub owner: Address,             // Goal owner
     pub locked: bool,               // Lock status
     pub timestamp: u64,             // Event timestamp
 }
@@ -399,16 +409,88 @@ pub struct GoalLockEvent {
 ### Event: Savings Schedule Created
 
 **Topic:** `("savings", SavingsEvent::ScheduleCreated)`
+**Emitted by:** `create_savings_schedule`
 
 **Data Structure:**
 
 ```rust
-pub struct SavingsScheduleCreatedEvent {
+pub struct ScheduleCreatedEvent {
     pub schedule_id: u32,           // Schedule ID
     pub goal_id: u32,               // Associated goal ID
+    pub owner: Address,             // Schedule owner
     pub amount: i128,               // Recurring amount
     pub next_due: u64,              // Next execution timestamp
     pub interval: u64,              // Interval in seconds
+    pub timestamp: u64,             // Event timestamp
+}
+```
+
+### Event: Savings Schedule Modified
+
+**Topic:** `("savings", SavingsEvent::ScheduleModified)`
+**Emitted by:** `modify_savings_schedule`
+
+**Data Structure:**
+
+```rust
+pub struct ScheduleModifiedEvent {
+    pub schedule_id: u32,           // Schedule ID
+    pub goal_id: u32,               // Associated goal ID
+    pub owner: Address,             // Schedule owner
+    pub amount: i128,               // Updated recurring amount
+    pub next_due: u64,              // Updated next execution timestamp
+    pub interval: u64,              // Updated interval in seconds
+    pub timestamp: u64,             // Event timestamp
+}
+```
+
+### Event: Savings Schedule Cancelled
+
+**Topic:** `("savings", SavingsEvent::ScheduleCancelled)`
+**Emitted by:** `cancel_savings_schedule`
+
+**Data Structure:**
+
+```rust
+pub struct ScheduleCancelledEvent {
+    pub schedule_id: u32,           // Schedule ID
+    pub goal_id: u32,               // Associated goal ID
+    pub owner: Address,             // Schedule owner
+    pub timestamp: u64,             // Event timestamp
+}
+```
+
+### Event: Savings Schedule Executed
+
+**Topic:** `("savings", SavingsEvent::ScheduleExecuted)`
+**Emitted by:** `execute_due_savings_schedules`, once per schedule that successfully credits its goal
+
+**Data Structure:**
+
+```rust
+pub struct ScheduleExecutedEvent {
+    pub schedule_id: u32,           // Schedule ID
+    pub goal_id: u32,               // Associated goal ID
+    pub owner: Address,             // Schedule owner
+    pub amount: i128,               // Amount credited this execution
+    pub timestamp: u64,             // Event timestamp
+}
+```
+
+### Event: Savings Schedule Missed Intervals
+
+**Topic:** `("savings", SavingsEvent::ScheduleMissed)`
+**Emitted by:** `execute_due_savings_schedules`, when one or more recurring intervals were skipped
+(delayed execution)
+
+**Data Structure:**
+
+```rust
+pub struct ScheduleMissedEvent {
+    pub schedule_id: u32,           // Schedule ID
+    pub goal_id: u32,               // Associated goal ID
+    pub owner: Address,             // Schedule owner
+    pub missed_count: u32,          // Number of intervals skipped
     pub timestamp: u64,             // Event timestamp
 }
 ```
@@ -1187,6 +1269,80 @@ pub struct ReportsArchivedEvent {
 
 ---
 
+## Emergency Kill Switch Contract
+
+**Contract Name:** `emergency_killswitch`  
+**Primary Topic Prefix:** `"emergency"`
+
+### Versioned control/audit stream (issue #1761)
+
+**Topic:** `("emergency", "control")`  
+**Emitted by:** every **committed** emergency transition — `initialize`,
+`configure_signers`, `activate`, `recover`, `bump_kill_switch_epoch`,
+`transfer_admin`, `pause` / `pause_with_reason`, `unpause`,
+`schedule_unpause`, `clear_emergency_state`, `pause_module` /
+`unpause_module`, `pause_function` / `unpause_function`, `migrate_storage`,
+`pre_upgrade`, `restore_from_snapshot`, `discard_snapshot`.
+
+**Data Structure:**
+
+```rust
+pub struct ControlEvent {
+    pub version: u32,          // EVENT_VERSION (schema version, currently 1)
+    pub seq: u64,              // monotonic per-contract correlation id
+    pub kind: Symbol,          // operation symbol, e.g. "pause", "admn_xfer"
+    pub actor: Option<Address>,// authorizing principal; None for consensus-driven
+                               // (threshold activation / recovery)
+    pub timestamp: u64,        // ledger timestamp at commit
+}
+```
+
+**Guarantees**
+
+- **Committed-only:** the record is published only *after* every state mutation
+  for the transition succeeded. Rejected, stale, repeated, or failed operations
+  emit nothing and leave no partial state.
+- **Correlation & ordering:** `seq` is a strictly increasing per-contract
+  counter persisted in instance storage (`DataKey::EventSeq`, observable via
+  `get_event_seq()`), so the audit stream is deterministically ordered and each
+  record is uniquely correlated.
+- **Versioned:** every record carries the event schema `version` so indexers
+  can detect on-wire changes without guessing.
+- **Complete:** `kind` + `actor` + `timestamp` identify what happened, who
+  authorized it (when a single principal exists), and when.
+
+**Ordering within one transition:** the granular per-transition event (e.g.
+`paused_v2`, `admn_xfer`) is emitted first, then the `control` record. Across
+transactions, ordering is by `seq`.
+
+### Legacy granular events (unchanged, backward compatible)
+
+Existing per-transition events continue to be emitted unchanged, e.g.:
+
+| Event | Topic | Payload |
+| ----- | ----- | ------- |
+| Global pause | `("emergency", "paused_v2")` | `PauseEvent { paused_at, paused_by }` |
+| Global unpause | `("emergency", "unpaused_v2")` | `UnpauseEvent { unpaused_at, unpaused_by }` |
+| Module pause | `("emergency", "m_paused_v2")` | `ModulePauseEvent { module_id, paused_at, paused_by }` |
+| Module unpause | `("emergency", "m_unpause_v2")` | `ModuleUnpauseEvent { module_id, unpaused_at, unpaused_by }` |
+| Function pause | `("emergency", "f_paused_v2")` | `FunctionPauseEvent { module_id, func, paused_at, paused_by }` |
+| Function unpause | `("emergency", "f_unpause_v2")` | `FunctionUnpauseEvent { module_id, func, unpaused_at, unpaused_by }` |
+| Admin transferred | `("emergency", "admn_xfer")` | `AdminTransferred { old_admin, new_admin, timestamp }` |
+| Signers configured | `("emergency", "signers_set")` | `(epoch, threshold, signer_count)` |
+| Activation | `("emergency", "activated")` | `(epoch, scope)` |
+| Recovery | `("emergency", "recovered")` | `(epoch, scope)` |
+| Epoch bump | `("emergency", "epch_bump")` | `(old_epoch, new_epoch)` |
+| Migration step | `("emergency", "migr_step")` | `(from_ver, to_ver, step, total)` |
+| Migration done | `("emergency", "migr_done")` | `(new_version, timestamp)` |
+| Snapshot taken | `("emergency", "snap_pre")` | `(schema_version, timestamp)` |
+| Snapshot restored | `("emergency", "snap_rst")` | `(schema_version, timestamp)` |
+| Snapshot discarded | `("emergency", "snap_dsc")` | `(timestamp,)` |
+
+`schedule_unpause` emits no granular event; it is auditable via the
+`("emergency", "control")` stream (`kind = "schedule"`).
+
+---
+
 ## Version Compatibility
 
 ### Contract Versioning
@@ -1283,6 +1439,7 @@ Per-contract:
 | `reporting`        | [reporting/src/events_schema_test.rs](reporting/src/events_schema_test.rs)               |
 | `savings_goals`    | [savings_goals/src/events_schema_test.rs](savings_goals/src/events_schema_test.rs)       |
 | `orchestrator`     | [orchestrator/src/events_schema_test.rs](orchestrator/src/events_schema_test.rs)         |
+| `insurance`        | [insurance/src/events_schema_test.rs](insurance/src/events_schema_test.rs)               |
 | `remitwise-common` | [remitwise-common/src/lib.rs](remitwise-common/src/lib.rs)                               |
 
 A failing schema test is the signal that **a change is breaking for indexers**.
@@ -1360,6 +1517,12 @@ A: Yes. Once emitted, events are immutable on-chain. They cannot be modified or 
 A: Use the `caller` or `owner` address field to trace operations across contracts. The orchestrator contract emits flow events that reference multiple sub-contracts.
 
 ---
+
+## Internal Audit Logs
+
+Each contract that maintains a rotating on-chain audit log is documented separately in [Audit Event Fields](docs/audit-event-fields.md). That document covers the common `AuditEntry` field set, per-contract storage keys, rotation behaviour, and the full inventory of operation symbols.
+
+Events documented in this file are the **external** on-chain events emitted via `env.events().publish()`. Internal audit logs are complementary — they are stored in contract instance storage and queried via contract-specific `get_audit_log` functions.
 
 ## Support & Updates
 
