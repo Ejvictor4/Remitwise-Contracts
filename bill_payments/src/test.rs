@@ -787,6 +787,42 @@ mod testsuit {
     }
 
     #[test]
+    fn test_without_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        
+        env.mock_all_auths();
+        let result = client.try_without(&owner, &1);
+        assert_eq!(result, Ok(Ok(())));
+    }
+
+    #[test]
+    fn test_without_invalid_id() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        
+        env.mock_all_auths();
+        let result = client.try_without(&owner, &0);
+        assert_eq!(result, Err(Ok(Error::BillNotFound)));
+    }
+
+    #[test]
+    fn test_without_unauthorized_id() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        
+        env.mock_all_auths();
+        let result = client.try_without(&owner, &999);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn test_get_all_bills_admin_only() {
         let env = Env::default();

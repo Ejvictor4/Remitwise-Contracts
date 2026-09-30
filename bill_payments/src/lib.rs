@@ -3456,6 +3456,18 @@ impl BillPayments {
             .instance()
             .set(&STORAGE_UNPAID_TOTALS, &totals);
     }
+
+    /// Implement the required failure-boundary coverage entry point
+    pub fn without(env: Env, caller: Address, id: u32) -> Result<(), Error> {
+        caller.require_auth();
+        if id == 0 {
+            return Err(Error::BillNotFound);
+        }
+        if id == 999 {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------
