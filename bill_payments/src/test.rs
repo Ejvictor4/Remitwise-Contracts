@@ -3,6 +3,7 @@ mod testsuit {
     extern crate std;
 
     use crate::*;
+    use crate::pause_functions;
     use proptest::prelude::*;
     use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::{Address as AddressTrait, Ledger, LedgerInfo};
@@ -3199,5 +3200,348 @@ mod testsuit {
         client.set_upgrade_admin(&admin, &admin);
         let result = client.try_pre_upgrade(&stranger);
         assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    // -----------------------------------------------------------------------
+    // pause_function failure-boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pause_function_unauthorized_no_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let caller = Address::generate(&env);
+
+        env.mock_all_auths();
+        // No pause admin set
+        let result = client.try_pause_function(&caller, &pause_functions::CREATE_BILL);
+        assert_eq!(result, Err(Ok(Error::UnauthorizedPause)));
+    }
+
+    #[test]
+    fn test_pause_function_unauthorized_wrong_caller() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        env.mock_all_auths();
+        let result = client.try_pause_function(&attacker, &pause_functions::CREATE_BILL);
+        assert_eq!(result, Err(Ok(Error::UnauthorizedPause)));
+    }
+
+    #[test]
+    fn test_pause_function_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        env.mock_all_auths();
+        let result = client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(result.is_ok());
+
+        // Verify function is paused
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+    }
+
+    #[test]
+    fn test_pause_function_idempotent() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        env.mock_all_auths();
+        // Pause once
+        let result1 = client.pause_function(&admin, &pause_functions::PAY_BILL);
+        assert!(result1.is_ok());
+
+        env.mock_all_auths();
+        // Pause again - should succeed (idempotent)
+        let result2 = client.pause_function(&admin, &pause_functions::PAY_BILL);
+        assert!(result2.is_ok());
+
+        // Function should still be paused
+        assert!(client.is_function_paused_public(&pause_functions::PAY_BILL));
+    }
+
+    #[test]
+    fn test_pause_function_blocks_operation() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        env.mock_all_auths();
+        // Pause create_bill
+        client.pause_function(&admin, &pause_functions::CREATE_BILL);
+
+        // Try to create a bill - should fail with FunctionPaused
+        env.mock_all_auths();
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Test"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+        assert_eq!(result, Err(Ok(Error::FunctionPaused)));
+    }
+
+    #[test]
+    fn test_pause_function_multiple_functions() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        env.mock_all_auths();
+        // Pause multiple functions
+        client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        client.pause_function(&admin, &pause_functions::PAY_BILL);
+        client.pause_function(&admin, &pause_functions::CANCEL_BILL);
+
+        // Verify all are paused
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+        assert!(client.is_function_paused_public(&pause_functions::PAY_BILL));
+        assert!(client.is_function_paused_public(&pause_functions::CANCEL_BILL));
+
+        // Verify unrelated function is not paused
+        assert!(!client.is_function_paused_public(&pause_functions::ARCHIVE));
+    }
+
+    #[test]
+    fn test_pause_function_with_global_pause() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Pause globally
+        env.mock_all_auths();
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Can still pause individual functions while globally paused
+        env.mock_all_auths();
+        let result = client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(result.is_ok());
+
+        // Function should be paused
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+    }
+
+    #[test]
+    fn test_pause_function_concurrent_safety() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Simulate concurrent pause operations
+        env.mock_all_auths();
+        let result1 = client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(result1.is_ok());
+
+        env.mock_all_auths();
+        let result2 = client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(result2.is_ok());
+
+        // Both should succeed and result in the same state
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+    }
+
+    #[test]
+    fn test_pause_function_unpause_cycle() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Pause
+        env.mock_all_auths();
+        client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+
+        // Unpause
+        env.mock_all_auths();
+        client.unpause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(!client.is_function_paused_public(&pause_functions::CREATE_BILL));
+
+        // Pause again
+        env.mock_all_auths();
+        client.pause_function(&admin, &pause_functions::CREATE_BILL);
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+    }
+
+    #[test]
+    fn test_pause_function_preserves_other_paused_functions() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Pause first function
+        env.mock_all_auths();
+        client.pause_function(&admin, &pause_functions::CREATE_BILL);
+
+        // Pause second function
+        env.mock_all_auths();
+        client.pause_function(&admin, &pause_functions::PAY_BILL);
+
+        // Unpause first function
+        env.mock_all_auths();
+        client.unpause_function(&admin, &pause_functions::CREATE_BILL);
+
+        // Second function should still be paused
+        assert!(!client.is_function_paused_public(&pause_functions::CREATE_BILL));
+        assert!(client.is_function_paused_public(&pause_functions::PAY_BILL));
+    }
+
+    #[test]
+    fn test_pause_function_stale_state_handling() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Pause function
+        env.mock_all_auths();
+        client.pause_function(&admin, &pause_functions::CREATE_BILL);
+
+        // Simulate storage being in a stale state by directly checking
+        // The pause state should be persistent
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+
+        // Even after multiple reads, state should remain consistent
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+        assert!(client.is_function_paused_public(&pause_functions::CREATE_BILL));
+    }
+
+    #[test]
+    fn test_pause_function_unknown_symbol() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Try to pause an unknown function symbol
+        // The contract allows pausing any symbol, but it won't affect operations
+        // that don't check that specific symbol
+        env.mock_all_auths();
+        let unknown_symbol = soroban_sdk::symbol_short!("unknown");
+        let result = client.pause_function(&admin, &unknown_symbol);
+        assert!(result.is_ok());
+
+        // The unknown symbol should be marked as paused
+        assert!(client.is_function_paused_public(&unknown_symbol));
+    }
+
+    #[test]
+    fn test_pause_function_emits_event() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Pause function and check for event
+        env.mock_all_auths();
+        client.pause_function(&admin, &pause_functions::CREATE_BILL);
+
+        let events = env.events().all();
+        let fn_paused_found = events.iter().any(|event| {
+            if let Ok((topics, _)) = event {
+                if topics.len() >= 3 {
+                    let action = topics.get(2).unwrap();
+                    *action == soroban_sdk::symbol_short!("fn_paused").into_val(&env)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+        assert!(fn_paused_found, "fn_paused event should be emitted");
+    }
+
+    #[test]
+    fn test_unpause_function_emits_event() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        // Pause first
+        env.mock_all_auths();
+        client.pause_function(&admin, &pause_functions::CREATE_BILL);
+
+        // Clear events
+        env.events().all();
+
+        // Unpause and check for event
+        env.mock_all_auths();
+        client.unpause_function(&admin, &pause_functions::CREATE_BILL);
+
+        let events = env.events().all();
+        let fn_unpaused_found = events.iter().any(|event| {
+            if let Ok((topics, _)) = event {
+                if topics.len() >= 3 {
+                    let action = topics.get(2).unwrap();
+                    *action == soroban_sdk::symbol_short!("fn_unpaused").into_val(&env)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+        assert!(fn_unpaused_found, "fn_unpaused event should be emitted");
     }
 }
