@@ -10,107 +10,115 @@ struct RegressionSpec {
     mem_threshold_percent: u64,
 }
 
+// Baselines were bumped for `initialize` requiring `admin.require_auth()`
+// (issue #1538 — front-running-the-constructor fix). Re-measured again for
+// issue #1761 (emergency & administrator controls: events and audit parity):
+// every committed transition now also persists a monotonic correlation
+// counter and publishes a versioned `("emergency", "control")` audit record,
+// which costs a storage read/write plus one event publish on each write path.
+// Read-only views drift slightly with the toolchain. Re-measured via
+// `cargo test -p emergency_killswitch --test gas_bench -- --nocapture`.
 const INITIALIZE: RegressionSpec = RegressionSpec {
-    cpu_baseline: 20769,
-    mem_baseline: 2378,
+    cpu_baseline: 43231,
+    mem_baseline: 4995,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const PAUSE: RegressionSpec = RegressionSpec {
-    cpu_baseline: 43358,
-    mem_baseline: 5217,
+    cpu_baseline: 86229,
+    mem_baseline: 9344,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const UNPAUSE: RegressionSpec = RegressionSpec {
-    cpu_baseline: 69428,
-    mem_baseline: 8000,
+    cpu_baseline: 118735,
+    mem_baseline: 13137,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const CLEAR_EMERGENCY: RegressionSpec = RegressionSpec {
-    cpu_baseline: 53721,
-    mem_baseline: 6568,
+    cpu_baseline: 102354,
+    mem_baseline: 11633,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const SCHEDULE_UNPAUSE: RegressionSpec = RegressionSpec {
-    cpu_baseline: 49093,
-    mem_baseline: 6317,
+    cpu_baseline: 87120,
+    mem_baseline: 10890,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const TRANSFER_ADMIN: RegressionSpec = RegressionSpec {
-    cpu_baseline: 40575,
-    mem_baseline: 4936,
+    cpu_baseline: 72528,
+    mem_baseline: 8461,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const PAUSE_FUNCTION: RegressionSpec = RegressionSpec {
-    cpu_baseline: 47263,
-    mem_baseline: 5701,
+    cpu_baseline: 77306,
+    mem_baseline: 9206,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const UNPAUSE_FUNCTION: RegressionSpec = RegressionSpec {
-    cpu_baseline: 63556,
-    mem_baseline: 7538,
+    cpu_baseline: 95410,
+    mem_baseline: 11226,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const PAUSE_MODULE: RegressionSpec = RegressionSpec {
-    cpu_baseline: 42067,
-    mem_baseline: 5238,
+    cpu_baseline: 70947,
+    mem_baseline: 8727,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const UNPAUSE_MODULE: RegressionSpec = RegressionSpec {
-    cpu_baseline: 52384,
-    mem_baseline: 6750,
+    cpu_baseline: 83073,
+    mem_baseline: 10422,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const IS_PAUSED: RegressionSpec = RegressionSpec {
-    cpu_baseline: 18092,
-    mem_baseline: 2070,
+    cpu_baseline: 27382,
+    mem_baseline: 3431,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const IS_FUNCTION_PAUSED: RegressionSpec = RegressionSpec {
-    cpu_baseline: 38097,
-    mem_baseline: 3890,
+    cpu_baseline: 48262,
+    mem_baseline: 5251,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const IS_MODULE_PAUSED: RegressionSpec = RegressionSpec {
-    cpu_baseline: 28118,
-    mem_baseline: 3142,
+    cpu_baseline: 37123,
+    mem_baseline: 4503,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const LIST_PAUSED_FUNCTIONS: RegressionSpec = RegressionSpec {
-    cpu_baseline: 32686,
-    mem_baseline: 3757,
+    cpu_baseline: 41935,
+    mem_baseline: 5118,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
 
 const GET_UNPAUSE_SCHEDULE: RegressionSpec = RegressionSpec {
-    cpu_baseline: 32393,
-    mem_baseline: 3702,
+    cpu_baseline: 46161,
+    mem_baseline: 5752,
     cpu_threshold_percent: 10,
     mem_threshold_percent: 10,
 };
@@ -314,22 +322,10 @@ fn bench_emergency_killswitch_transfer_admin() {
     let new_admin = Address::generate(&env);
     client.initialize(&admin);
 
-    let (cpu, mem, _) = measure(&env, || client.transfer_admin(&new_admin));
+    let (cpu, mem, _) = measure(&env, || client.transfer_admin(&new_admin, &0u64));
 
-    emit_bench_result(
-        "transfer_admin",
-        "admin_transfer",
-        cpu,
-        mem,
-        TRANSFER_ADMIN,
-    );
-    assert_regression_bounds(
-        "transfer_admin",
-        "admin_transfer",
-        cpu,
-        mem,
-        TRANSFER_ADMIN,
-    );
+    emit_bench_result("transfer_admin", "admin_transfer", cpu, mem, TRANSFER_ADMIN);
+    assert_regression_bounds("transfer_admin", "admin_transfer", cpu, mem, TRANSFER_ADMIN);
 }
 
 #[test]
