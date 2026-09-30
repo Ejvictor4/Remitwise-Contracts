@@ -90,26 +90,26 @@ mod mock_remittance_split {
     pub struct MockRemittanceSplit;
 
     /// Returns a fixed 50/30/15/5 split matching the standard four categories.
-    /// Percentages are whole-number percents (100 = 100%), which is the
-    /// format `get_remittance_summary_internal` validates against (sum == 100).
+    /// Percentages are basis points (10_000 = 100%), which is the format
+    /// `get_remittance_summary_internal` validates against (sum == 10_000).
     /// Security: no auth required on read-only split queries.
     #[contractimpl]
     impl RemittanceSplitTrait for MockRemittanceSplit {
         fn get_split(env: &Env) -> Vec<u32> {
             let mut split = Vec::new(env);
-            split.push_back(50u32);
-            split.push_back(30u32);
-            split.push_back(15u32);
-            split.push_back(5u32);
+            split.push_back(5000u32);
+            split.push_back(3000u32);
+            split.push_back(1500u32);
+            split.push_back(500u32);
             split
         }
 
         fn calculate_split(env: Env, total_amount: i128) -> Vec<i128> {
             let mut amounts = Vec::new(&env);
-            amounts.push_back(total_amount * 50 / 100);
-            amounts.push_back(total_amount * 30 / 100);
-            amounts.push_back(total_amount * 15 / 100);
-            amounts.push_back(total_amount * 5 / 100);
+            amounts.push_back(total_amount * 5000 / 10_000);
+            amounts.push_back(total_amount * 3000 / 10_000);
+            amounts.push_back(total_amount * 1500 / 10_000);
+            amounts.push_back(total_amount * 500 / 10_000);
             amounts
         }
     }

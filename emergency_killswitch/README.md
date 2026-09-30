@@ -2,6 +2,8 @@
 
 A Soroban smart contract for centralized emergency pause controls across multiple modules/contracts with global, module, and per-function pause granularity.
 
+> **Scope note:** "modules" here means logical groupings *within this contract's own storage* (module/function symbols you define yourself), not the other deployable contracts in this workspace (`bill_payments`, `insurance`, etc.). This contract is not currently cross-called by any of them — pausing it has no effect on their write paths. See [docs/EMERGENCY_SHUTDOWN.md](../docs/EMERGENCY_SHUTDOWN.md) for the repo-wide picture and what actually stops a given contract from accepting writes today.
+
 ## Features
 
 - Global pause (all modules/functions)
@@ -68,6 +70,10 @@ Unpauses after scheduled time is reached.
 
 Returns true if globally paused.
 
+#### `get_recovery_ready_at(env)`
+
+Returns the quorum-activation recovery deadline, or `None` if no activation is in progress.
+
 ### Module Controls
 
 #### `pause_module(env, module_id)`
@@ -97,4 +103,13 @@ Checks if a function is paused (considering global, module, and function-level p
 ```bash
 cargo test -p emergency_killswitch
 ```
+
+## Design Documentation
+
+- [Activation and Recovery Policy](ACTIVATION_RECOVERY_POLICY.md) — Epoch semantics, scope invariants, activation/recovery protocol, failure matrix.
+- [Atomic Rollback Guarantees](../docs/ATOMIC_ROLLBACK.md) — The validate-then-write pattern enforced by `activate()`, the two bugs that were fixed, and regression test coverage.
+- [Killswitch Trust Model](../docs/killswitch-trust-model.md) — Who can trigger/clear, what state is preserved.
+- [Pause/Unpause State Machine](../docs/killswitch-pause-state-machine.md) — Global state transitions and the module/function layers.
+- [Kill-Switch Recovery Runbook](../docs/KILL_SWITCH_RECOVERY.md) — Operator guide for engaging and recovering the kill switch.
+
 
