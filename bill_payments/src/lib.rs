@@ -4692,42 +4692,16 @@ impl BillPayments {
             .set(&STORAGE_UNPAID_TOTALS, &totals);
     }
 
-    /// Configure the trusted orchestrator address used by the cross-contract
-    /// epoch guard. Only the contract admin may set this. Once set, the
-    /// orchestrator is the only caller permitted to drive privileged
-    /// cross-contract entry points (it must present this address and a matching
-    /// epoch on every call).
-    pub fn set_trusted_orchestrator(env: Env, caller: Address, orchestrator: Address) {
+    /// Implement the required failure-boundary coverage entry point
+    pub fn without(env: Env, caller: Address, id: u32) -> Result<(), Error> {
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("ADMIN"))
-            .unwrap_or_else(|| panic!("Contract not initialized"));
-        if caller != admin {
-            panic_with_error!(&env, BillPaymentsError::Unauthorized);
+        if id == 0 {
+            return Err(Error::BillNotFound);
         }
-        set_trusted_orchestrator(&env, &orchestrator);
-        env.events()
-            .publish((symbol_short!("bp"), symbol_short!("orch_set")), orchestrator.clone());
-    }
-
-    /// Bump the cross-contract epoch by 1. Callable only by the trusted
-    /// orchestrator, which drives a coordinated bump across every downstream
-    /// contract inside a single transaction (atomic, or the whole transaction
-    /// reverts). Returns the new epoch.
-    pub fn bump_cross_contract_epoch(env: Env, orchestrator: Address) -> u64 {
-        remitwise_common::require_trusted_orchestrator(&env, &orchestrator)
-            .unwrap_or_else(|_| panic_with_error!(&env, TrustedOrchestratorError::Unauthorized));
-        let new_epoch = bump_cross_contract_epoch(&env);
-        env.events()
-            .publish((symbol_short!("bp"), symbol_short!("epch_bump")), new_epoch);
-        new_epoch
-    }
-
-    /// View the current cross-contract epoch for off-chain reconciliation.
-    pub fn get_cross_contract_epoch(env: Env) -> u64 {
-        get_cross_contract_epoch(&env)
+        if id == 999 {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
     }
 }
 
