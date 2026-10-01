@@ -4966,3 +4966,6 @@ mod pause_query_boundary_tests;
 
 #[cfg(test)]
 mod tests_pause_admin_boundary;
+
+#[cfg(test)]
+mod tests_set_pause_admin_boundary;
