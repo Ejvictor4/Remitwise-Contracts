@@ -1297,6 +1297,22 @@ impl BillPayments {
 
     /// @notice Pause a specific function without pausing the entire contract.
     /// @dev Uses `func` symbols defined in `pause_functions`.
+    ///
+    /// # Deterministic Properties
+    /// - **Idempotent**: Calling pause_function multiple times on the same function
+    ///   is safe and produces the same final state (function paused).
+    /// - **Retry-safe**: If the transaction fails after storage update but before
+    ///   event emission, a retry will succeed without side effects.
+    /// - **State-preserving**: Other paused functions remain unchanged.
+    ///
+    /// # Failure Boundaries
+    /// - Returns `UnauthorizedPause` if no pause admin is set or caller is not admin
+    /// - Fails fast before storage mutation on authorization errors
+    /// - Storage update is atomic (single set operation)
+    ///
+    /// # Events
+    /// Emits `fn_paused` event with the paused function symbol for audit trail.
+    ///
     /// @return Ok(()) on success, otherwise `Error::UnauthorizedPause`.
     pub fn pause_function(env: Env, caller: Address, func: Symbol) -> Result<(), Error> {
         remitwise_common::require_no_active_kill_switch(&env)
@@ -1307,20 +1323,52 @@ impl BillPayments {
         if admin != caller {
             return Err(BillPaymentsError::UnauthorizedPause);
         }
+
+        // Load existing paused functions map or create new one
         let mut m: Map<Symbol, bool> = env
             .storage()
             .instance()
             .get(&symbol_short!("PAUSED_FN"))
             .unwrap_or_else(|| Map::new(&env));
+
+        // Set function to paused (idempotent - overwriting true with true is no-op)
         m.set(func, true);
+
+        // Atomic storage update
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSED_FN"), &m);
+
+        // Emit event for audit trail (after storage update for retry safety)
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("fn_paused"),
+            func,
+        );
+
         Ok(())
     }
 
     /// @notice Unpause a previously paused function.
     /// @dev Uses `func` symbols defined in `pause_functions`.
+    ///
+    /// # Deterministic Properties
+    /// - **Idempotent**: Calling unpause_function multiple times on the same function
+    ///   is safe and produces the same final state (function unpaused).
+    /// - **Retry-safe**: If the transaction fails after storage update but before
+    ///   event emission, a retry will succeed without side effects.
+    /// - **State-preserving**: Other paused functions remain unchanged.
+    ///
+    /// # Failure Boundaries
+    /// - Returns `UnauthorizedPause` if no pause admin is set or caller is not admin
+    /// - Fails fast before storage mutation on authorization errors
+    /// - Storage update is atomic (single set operation)
+    ///
+    /// # Events
+    /// Emits `fn_unpaused` event with the unpaused function symbol for audit trail.
+    ///
     /// @return Ok(()) on success, otherwise `Error::UnauthorizedPause`.
     pub fn unpause_function(env: Env, caller: Address, func: Symbol) -> Result<(), Error> {
         remitwise_common::require_no_active_kill_switch(&env)
@@ -1331,15 +1379,31 @@ impl BillPayments {
         if admin != caller {
             return Err(BillPaymentsError::UnauthorizedPause);
         }
+
+        // Load existing paused functions map or create new one
         let mut m: Map<Symbol, bool> = env
             .storage()
             .instance()
             .get(&symbol_short!("PAUSED_FN"))
             .unwrap_or_else(|| Map::new(&env));
+
+        // Set function to unpaused (idempotent - overwriting false with false is no-op)
         m.set(func, false);
+
+        // Atomic storage update
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSED_FN"), &m);
+
+        // Emit event for audit trail (after storage update for retry safety)
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("fn_unpaused"),
+            func,
+        );
+
         Ok(())
     }
 
